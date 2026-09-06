@@ -3269,7 +3269,18 @@ def _write_v2_pair(pinvi_root: Path, blobs: dict[str, bytes]) -> dict[str, objec
     (pinvi_root / "contracts/kor-travel-map-m05-pair-provenance-v1.json").write_text(
         json.dumps(pair), encoding="utf-8"
     )
+    # service 릴리스 revision의 **정본** 문서. v2에서 pair 계약이 그 사본을 걷어내므로
+    # 하네스는 이 문서에서 값을 읽어야 한다 — pinned Map revision을 넣으면 PinVi가
+    # 부팅 시 거부한다.
+    (pinvi_root / "contracts/kor-travel-map-service-provenance-v1.json").write_text(
+        json.dumps({"map_release_revision": _SERVICE_RELEASE_REVISION}), encoding="utf-8"
+    )
     return pair
+
+
+#: 픽스처의 service 릴리스 revision. pinned Map revision과 **다른** 값이어야 이
+#: 게이트가 무엇을 보는지 분명해진다 — 두 값은 재핀 주기가 달라 실제로 갈라진다.
+_SERVICE_RELEASE_REVISION = "7" * 40
 
 
 def test_pair_v2_anchors_every_surface_to_the_pinned_release(
@@ -3326,7 +3337,52 @@ def test_pair_v2_anchors_every_surface_to_the_pinned_release(
     assert {args[-1] for args in fetches} == {pinned}
     assert actual.map_full_openapi_sha256 == pair["map"]["full"]["openapi_sha256"]
     assert service_openapi_sha256 == pair["map"]["service"]["openapi_sha256"]
-    assert service_source_revision == pinned
+    # service 표면의 revision은 pin registry가 정하지 않는다. 그 값의 정본은 PinVi의
+    # service-provenance 계약이고, `config.py`가 컨테이너 부팅 때 이 env를 그 계약과
+    # 대조한다 — pinned를 넣으면 71분 rebuild 뒤 기동 실패다(적대 리뷰 P0).
+    assert service_source_revision == _SERVICE_RELEASE_REVISION
+    assert service_source_revision != pinned
+
+
+@pytest.mark.parametrize("broken", ("z" * 40, "1" * 39, 12345, None))
+def test_pair_v2_rejects_a_malformed_service_release_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken: object
+) -> None:
+    """service 릴리스 revision이 commit이 아니면 env로 흘려보내지 않는다.
+
+    이 값은 PinVi 컨테이너의 env가 되고 PinVi가 부팅 때 자기 계약과 대조한다.
+    형식 검사가 없으면 잘못된 값이 71분 rebuild 뒤에야 드러난다.
+    """
+
+    driver = _driver()
+    pinvi_root = tmp_path / "pinvi"
+    map_root = tmp_path / "map"
+    map_root.mkdir()
+    paths = {
+        "admin": "packages/kor-travel-map-api/openapi.json",
+        "full": "packages/kor-travel-map-api/openapi.json",
+        "service": "packages/kor-travel-map-api/openapi.service.json",
+        "user": "packages/kor-travel-map-api/openapi.user.json",
+    }
+    blobs = {path: json.dumps({"path": path}).encode() for path in set(paths.values())}
+    _write_v2_pair(pinvi_root, blobs)
+    (pinvi_root / "contracts/kor-travel-map-service-provenance-v1.json").write_text(
+        json.dumps({"map_release_revision": broken}), encoding="utf-8"
+    )
+
+    def fake_run(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        _revision, _, path = args[-1].partition(":")
+        return subprocess.CompletedProcess(args, 0, stdout=blobs[path])
+
+    monkeypatch.setattr(driver, "_command", lambda *a, **k: "")
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+
+    with pytest.raises(driver._PhaseError) as error:
+        driver._pair(pinvi_root, map_root)
+
+    assert error.value.diagnostic == "Map service release revision is not a 40-hex commit"
 
 
 def test_pair_v2_rejects_a_declared_source_revision(

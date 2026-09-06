@@ -1772,6 +1772,8 @@ _PAIR_DIAGNOSTICS: frozenset[str] = frozenset(
         "pair contract version is unsupported",
         "pair contract v2 must not declare a source revision",
         "pair source blob digest differs from the pinned release",
+        "Map service provenance contract is unreadable",
+        "Map service release revision is not a 40-hex commit",
         # `_source_pair_preflight`가 이미 쓰던 셋. 같은 phase를 내므로 같은
         # 어휘에 들어와야 preflight가 이것도 내보인다.
         "committed pinned-runtime generation manifest unavailable",
@@ -1793,6 +1795,35 @@ def _sha256_text(value: object) -> str:
 
 #: PinVi가 vendoring하는 pair 계약의 저장소 내 경로.
 _PAIR_CONTRACT_PATH = "contracts/kor-travel-map-m05-pair-provenance-v1.json"
+
+#: service 표면의 릴리스 revision **정본**. PinVi `config.py`가 컨테이너 부팅 때
+#: 이 값과 env를 대조하므로, 하네스가 env에 넣는 값도 여기서 나와야 한다.
+_SERVICE_PROVENANCE_PATH = "contracts/kor-travel-map-service-provenance-v1.json"
+
+
+def _service_release_revision(pinvi_root: Path) -> str:
+    """service 릴리스 revision을 그 값의 정본 문서에서 읽는다."""
+
+    try:
+        document = json.loads(
+            (pinvi_root / _SERVICE_PROVENANCE_PATH).read_text(encoding="utf-8")
+        )
+        revision = document["map_release_revision"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        _fail(
+            "pair_contract_invalid",
+            diagnostic="Map service provenance contract is unreadable",
+        )
+    if (
+        not isinstance(revision, str)
+        or len(revision) != _REVISION_LENGTH
+        or any(char not in "0123456789abcdef" for char in revision)
+    ):
+        _fail(
+            "pair_contract_invalid",
+            diagnostic="Map service release revision is not a 40-hex commit",
+        )
+    return revision
 
 #: pair 계약의 네 표면이 Map source의 어느 파일에서 나오는지. 격리 e2e의 `_pair`와
 #: 회전 preflight가 **같은 한 곳**에서 읽는다 — 두 곳에 따로 적으면 표면이 늘 때
@@ -1995,11 +2026,13 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         if not isinstance(service_source_revision, str):
             _fail("pair_contract_invalid", diagnostic="pair service entry is invalid")
     else:
-        # v2에서 service 표면의 revision도 계약이 아니라 **릴리스**가 정한다.
-        # 이것이 이 전환이 없애는 사본 중 하나다 — 이 값은 PinVi의
-        # `contracts/kor-travel-map-service-provenance-v1.json`에도 같은 사실로
-        # 다시 적혀 있었다.
-        service_source_revision = pinned_map_revision
+        # v2에서 service 표면의 revision을 정하는 것은 pin registry가 **아니다.**
+        # 그 값의 정본은 PinVi의 `kor-travel-map-service-provenance-v1.json`이고,
+        # v1 pair 계약이 그것을 세 번째로 선언하고 있었을 뿐이다. 여기에 pinned
+        # Map revision을 넣으면 PinVi가 부팅 시 거부한다 — `config.py`의
+        # `validate_feature_reference_reconciliation`이 이 값을 그 계약과 대조하고,
+        # 두 값은 재핀 주기가 달라 실제로 갈라져 있다(적대 리뷰 P0).
+        service_source_revision = _service_release_revision(pinvi_root)
     return (
         M05IsolatedPairEvidence(
             map_full_openapi_sha256=map_hash,
