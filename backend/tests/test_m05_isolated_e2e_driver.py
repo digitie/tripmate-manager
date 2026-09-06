@@ -3333,8 +3333,10 @@ def test_pair_v2_anchors_every_surface_to_the_pinned_release(
 
     # 네 read 전부가 pinned revision에서 났다 — 이것이 v2의 실질이다.
     assert reads and all(target.startswith(pinned + ":") for target in reads)
-    # fetch도 하나로 줄어든다(계약이 네 revision을 흩뿌리지 않으므로).
-    assert {args[-1] for args in fetches} == {pinned}
+    # fetch는 둘이다: 릴리스 revision과 service 표면의 릴리스 revision. 후자는
+    # 대조에 쓰이지 않고 **PinVi attestation이 읽을 수 있게** 보충하는 것이다
+    # (계약이 네 revision을 흩뿌리던 v1과 달리 흩어지지 않는다).
+    assert {args[-1] for args in fetches} == {pinned, _SERVICE_RELEASE_REVISION}
     assert actual.map_full_openapi_sha256 == pair["map"]["full"]["openapi_sha256"]
     assert service_openapi_sha256 == pair["map"]["service"]["openapi_sha256"]
     # service 표면의 revision은 pin registry가 정하지 않는다. 그 값의 정본은 PinVi의

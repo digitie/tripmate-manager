@@ -1922,6 +1922,10 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         # "계약은 자기무모순이다"만 증명했다. v2에서는 네 entry 전부가 릴리스의
         # blob과 대조되므로, service·user 표면이 **처음으로** 릴리스에 결박된다.
         revisions.add(pinned_map_revision)
+        # PinVi attestation은 service 표면을 **그 표면의 릴리스 revision**에서
+        # 읽는다(`_surface_revisions`). 그 object가 checkout에 없으면 하네스가
+        # 다 돌고 난 뒤 `git show`에서 죽는다 — 여기서 함께 보충한다.
+        revisions.add(_service_release_revision(pinvi_root))
     map_hash = _sha256_text(full.get("openapi_sha256"))
     if version == 1:
         # v1에서만 필요한 두 검사다. 계약이 자기 revision을 선언하므로 그것이
