@@ -2863,12 +2863,47 @@ def _rotation_contract(*, admin: str, full: str, version: int = 1) -> bytes:
     ).encode("utf-8")
 
 
-def _rotation_contract_v2() -> bytes:
-    """v2 봉투 — revision 선언이 없다."""
+#: 회전 대상 Map revision이 내놓는다고 가정하는 표면 blob. 실제 파일 내용이
+#: 무엇이든 상관없다 — 게이트가 보는 것은 "계약의 digest == blob의 digest"다.
+_ROTATION_MAP_BLOB = b'{"openapi":"3.1.0"}'
+_ROTATION_MAP_DIGEST = hashlib.sha256(_ROTATION_MAP_BLOB).hexdigest()
 
+
+def _rotation_contract_v2(**overrides: str) -> bytes:
+    """v2 봉투 — revision 선언이 없고 네 표면의 digest만 있다."""
+
+    digests = dict.fromkeys(
+        ("admin", "full", "service", "user"), _ROTATION_MAP_DIGEST
+    )
+    digests.update(overrides)
     return json.dumps(
-        {"map": {name: {"openapi_sha256": "a" * 64} for name in ("admin", "full")}, "version": 2}
+        {
+            "map": {name: {"openapi_sha256": digest} for name, digest in digests.items()},
+            "version": 2,
+        }
     ).encode("utf-8")
+
+
+def _rotation_map_blobs(driver, monkeypatch, *, readable: bool = True) -> None:
+    """회전 대상 Map revision의 blob 읽기를 대역으로 바꾼다.
+
+    `subprocess`를 모듈 속성으로 갈아끼운다 — 실제 `subprocess.run`을 monkeypatch
+    하면 같은 인터프리터의 다른 코드까지 함께 바뀐다.
+    """
+
+    class _Result:
+        returncode = 0 if readable else 128
+        stdout = _ROTATION_MAP_BLOB if readable else b""
+
+    class _Subprocess:
+        PIPE = -1
+        DEVNULL = -3
+
+        @staticmethod
+        def run(*args: object, **kwargs: object) -> object:
+            return _Result()
+
+    monkeypatch.setattr(driver, "subprocess", _Subprocess)
 
 
 def _run_rotation_preflight(
@@ -2958,31 +2993,93 @@ def test_rotation_preflight_refuses_a_contract_whose_admin_and_full_disagree(
     assert "admin" in out and "full" in out
 
 
-def test_rotation_preflight_accepts_v2_without_comparing_revisions(
-    monkeypatch, capsys
-) -> None:
-    """v2에는 비교할 문자열이 없다 — 회전이 만들 수 있는 모순이 사라졌다.
-
-    이 게이트는 "계약이 지목한 Map revision"과 "회전 대상 Map revision"이 어긋나는
-    것을 막으려고 있다. v2는 그 선언을 계약에서 걷어내 **생산자를 pin registry
-    하나로** 만들므로, 막을 모순 자체가 구조적으로 존재하지 않는다.
-
-    검사가 약해지는 것이 아니다 — 격리 preflight가 네 표면의 digest를 릴리스의
-    blob과 대조하고, v1에서는 그 대조가 계약 자신의 revision에 앵커돼 있어
-    service·user는 릴리스와 한 번도 맞춰지지 않았다.
-    """
-
+def _run_rotation_preflight_v2(
+    monkeypatch,
+    capsys,
+    *,
+    contract: bytes,
+    readable: bool = True,
+) -> tuple[int, str]:
     driver = _driver()
 
     def command(*args: str, **kwargs: object) -> str:
         if "show" in args:
-            return _rotation_contract_v2().decode("utf-8")
+            return contract.decode("utf-8")
         return ""
 
     monkeypatch.setattr(driver, "_command", command)
+    _rotation_map_blobs(driver, monkeypatch, readable=readable)
+    status = driver.rotation_preflight("a" * 40, "b" * 40)
+    return status, capsys.readouterr().out
 
-    assert driver.rotation_preflight("a" * 40, "b" * 40) == 0
-    assert "v2" in capsys.readouterr().out
+
+def test_rotation_preflight_accepts_v2_when_the_digests_match_the_target_map(
+    monkeypatch, capsys
+) -> None:
+    """게이트가 무조건 거부하는 것이 아님을 먼저 건다."""
+
+    status, _out = _run_rotation_preflight_v2(
+        monkeypatch, capsys, contract=_rotation_contract_v2()
+    )
+
+    assert status == 0
+
+
+def test_rotation_preflight_refuses_v2_whose_surface_digest_differs_from_the_target_map(
+    monkeypatch, capsys
+) -> None:
+    """v2에서 "이 계약은 저 Map을 가리킨다"를 말하는 것은 digest다.
+
+    v1은 그것을 `map.full.source_revision` 문자열로 말했고 이 게이트는 그 문자열을
+    봤다. v2가 그 선언을 걷어낸 뒤 게이트를 무조건 통과로 두면, 계약과 어긋난 Map
+    revision으로의 회전이 **71분짜리 rebuild를 다 태운 뒤에야** 격리 preflight에서
+    거부된다 — 이 게이트가 존재하는 바로 그 실패다(2026-09-02).
+
+    service·user 표면까지 보는 것이 v1보다 오히려 넓다. v1의 digest 대조는 계약
+    자신이 지목한 revision에 앵커돼 있어 "계약은 자기무모순이다"만 증명했다.
+    """
+
+    stale = "9" * 64
+    status, out = _run_rotation_preflight_v2(
+        monkeypatch, capsys, contract=_rotation_contract_v2(user=stale)
+    )
+
+    assert status == 1
+    # 두 값이 **실제로** 보여야 한다. 안 보이면 운영자가 다시 역추적한다.
+    assert stale in out
+    assert _ROTATION_MAP_DIGEST in out
+    assert "user" in out
+
+
+def test_rotation_preflight_refuses_v2_when_the_target_map_surface_is_unreadable(
+    monkeypatch, capsys
+) -> None:
+    """표면을 못 읽으면 통과가 아니라 거부다 — 모르는 것은 괜찮은 것이 아니다."""
+
+    status, out = _run_rotation_preflight_v2(
+        monkeypatch, capsys, contract=_rotation_contract_v2(), readable=False
+    )
+
+    assert status == 1
+    assert "unreadable" in out
+
+
+def test_rotation_preflight_refuses_v2_with_a_non_sha256_surface_digest(
+    monkeypatch, capsys
+) -> None:
+    """digest가 digest가 아니면 대조 자체가 성립하지 않는다.
+
+    길이만 보면 "z"*64 같은 값이 그대로 통과해 **digest 불일치**로 잘못 보고된다.
+    운영자의 다음 행동이 다르므로(계약 오작성 vs 표면 변경) 두 경우를 함께 건다.
+    """
+
+    for broken in ("not-a-digest", "z" * 64):
+        status, out = _run_rotation_preflight_v2(
+            monkeypatch, capsys, contract=_rotation_contract_v2(service=broken)
+        )
+
+        assert status == 1
+        assert "sha256" in out
 
 
 def test_rotation_preflight_refuses_an_unsupported_contract_version(
