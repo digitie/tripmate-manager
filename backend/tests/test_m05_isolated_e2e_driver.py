@@ -2865,6 +2865,9 @@ def _rotation_contract(*, admin: str, full: str, version: int = 1) -> bytes:
 
 #: 회전 대상 Map revision이 내놓는다고 가정하는 표면 blob. 실제 파일 내용이
 #: 무엇이든 상관없다 — 게이트가 보는 것은 "계약의 digest == blob의 digest"다.
+#: 회전 **대상** Map revision. pinned와 다른 값이어야 게이트가 무엇에 앵커돼 있는지
+#: 드러난다 — pinned로 읽어도 통과하는 구현은 이 게이트의 목적을 잃은 것이다.
+_ROTATION_MAP_REVISION = "a" * 40
 _ROTATION_MAP_BLOB = b'{"openapi":"3.1.0"}'
 _ROTATION_MAP_DIGEST = hashlib.sha256(_ROTATION_MAP_BLOB).hexdigest()
 
@@ -2884,12 +2887,20 @@ def _rotation_contract_v2(**overrides: str) -> bytes:
     ).encode("utf-8")
 
 
-def _rotation_map_blobs(driver, monkeypatch, *, readable: bool = True) -> None:
-    """회전 대상 Map revision의 blob 읽기를 대역으로 바꾼다.
+def _rotation_map_blobs(
+    driver, monkeypatch, *, readable: bool = True
+) -> tuple[list[str], list[tuple[str, ...]]]:
+    """회전 대상 Map revision의 blob 읽기를 대역으로 바꾸고 **대상을 기록**한다.
 
     `subprocess`를 모듈 속성으로 갈아끼운다 — 실제 `subprocess.run`을 monkeypatch
     하면 같은 인터프리터의 다른 코드까지 함께 바뀐다.
+
+    반환하는 두 리스트는 게이트가 **무엇을** 읽었는지를 담는다. digest 비교만
+    단언하면 저장소·revision·경로를 잘못 지목해도 초록이다(2차 적대 리뷰).
     """
+
+    reads: list[str] = []
+    fetches: list[tuple[str, ...]] = []
 
     class _Result:
         returncode = 0 if readable else 128
@@ -2900,10 +2911,12 @@ def _rotation_map_blobs(driver, monkeypatch, *, readable: bool = True) -> None:
         DEVNULL = -3
 
         @staticmethod
-        def run(*args: object, **kwargs: object) -> object:
+        def run(args: list[str], **_kwargs: object) -> object:
+            reads.append(args[-1])
             return _Result()
 
     monkeypatch.setattr(driver, "subprocess", _Subprocess)
+    return reads, fetches
 
 
 def _run_rotation_preflight(
@@ -2999,18 +3012,20 @@ def _run_rotation_preflight_v2(
     *,
     contract: bytes,
     readable: bool = True,
-) -> tuple[int, str]:
+) -> tuple[int, str, list[str], list[tuple[str, ...]]]:
     driver = _driver()
+    reads, fetches = _rotation_map_blobs(driver, monkeypatch, readable=readable)
 
     def command(*args: str, **kwargs: object) -> str:
         if "show" in args:
             return contract.decode("utf-8")
+        if "fetch" in args:
+            fetches.append(args)
         return ""
 
     monkeypatch.setattr(driver, "_command", command)
-    _rotation_map_blobs(driver, monkeypatch, readable=readable)
-    status = driver.rotation_preflight("a" * 40, "b" * 40)
-    return status, capsys.readouterr().out
+    status = driver.rotation_preflight(_ROTATION_MAP_REVISION, "b" * 40)
+    return status, capsys.readouterr().out, reads, fetches
 
 
 def test_rotation_preflight_accepts_v2_when_the_digests_match_the_target_map(
@@ -3018,11 +3033,28 @@ def test_rotation_preflight_accepts_v2_when_the_digests_match_the_target_map(
 ) -> None:
     """게이트가 무조건 거부하는 것이 아님을 먼저 건다."""
 
-    status, _out = _run_rotation_preflight_v2(
+    status, _out, reads, fetches = _run_rotation_preflight_v2(
         monkeypatch, capsys, contract=_rotation_contract_v2()
     )
 
     assert status == 0
+    # 게이트가 **무엇을** 읽었는지까지 본다. digest 비교만 단언하면 저장소·revision·
+    # 경로를 잘못 지목해도 초록이고, 그러면 회전 대상과의 결박이 사라진다.
+    map_url = PINNED_RUNTIME_RELEASE.source_for("map").canonical_url
+    pinvi_url = PINNED_RUNTIME_RELEASE.source_for("pinvi").canonical_url
+    # 두 fetch가 각각 **자기 저장소의 회전 대상 revision**을 가져온다.
+    assert [args[-2:] for args in fetches] == [
+        (pinvi_url, "b" * 40),
+        (map_url, _ROTATION_MAP_REVISION),
+    ]
+    assert reads and all(
+        target.startswith(_ROTATION_MAP_REVISION + ":") for target in reads
+    )
+    assert {target.partition(":")[2] for target in reads} == {
+        "packages/kor-travel-map-api/openapi.json",
+        "packages/kor-travel-map-api/openapi.service.json",
+        "packages/kor-travel-map-api/openapi.user.json",
+    }
 
 
 def test_rotation_preflight_refuses_v2_whose_surface_digest_differs_from_the_target_map(
@@ -3040,7 +3072,7 @@ def test_rotation_preflight_refuses_v2_whose_surface_digest_differs_from_the_tar
     """
 
     stale = "9" * 64
-    status, out = _run_rotation_preflight_v2(
+    status, out, _reads, _fetches = _run_rotation_preflight_v2(
         monkeypatch, capsys, contract=_rotation_contract_v2(user=stale)
     )
 
@@ -3056,7 +3088,7 @@ def test_rotation_preflight_refuses_v2_when_the_target_map_surface_is_unreadable
 ) -> None:
     """표면을 못 읽으면 통과가 아니라 거부다 — 모르는 것은 괜찮은 것이 아니다."""
 
-    status, out = _run_rotation_preflight_v2(
+    status, out, _reads, _fetches = _run_rotation_preflight_v2(
         monkeypatch, capsys, contract=_rotation_contract_v2(), readable=False
     )
 
@@ -3074,7 +3106,7 @@ def test_rotation_preflight_refuses_v2_with_a_non_sha256_surface_digest(
     """
 
     for broken in ("not-a-digest", "z" * 64):
-        status, out = _run_rotation_preflight_v2(
+        status, out, _reads, _fetches = _run_rotation_preflight_v2(
             monkeypatch, capsys, contract=_rotation_contract_v2(service=broken)
         )
 

@@ -1793,6 +1793,8 @@ def _sha256_text(value: object) -> str:
     return value
 
 
+#: 이 파일이 인용하는 `T-VN-PAIR-V2`의 정본 문서는 **Map 저장소**의
+#: `docs/tasks-acceptance.md` 같은 이름 절이다(v1 분기를 언제 뗄지가 §7에 있다).
 #: PinVi가 vendoring하는 pair 계약의 저장소 내 경로.
 _PAIR_CONTRACT_PATH = "contracts/kor-travel-map-m05-pair-provenance-v1.json"
 
