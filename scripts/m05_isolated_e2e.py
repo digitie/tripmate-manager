@@ -2353,20 +2353,6 @@ def verify_leaf(leaf: Path) -> int:
         f"registry={PINNED_RUNTIME_RELEASE.pinset_sha256}",
     )
 
-    try:
-        trusted_manager = trusted_manager_source_revision()
-    except (DeploymentContractError, OSError, ValueError):
-        trusted_manager = None
-    record(
-        "L4 Manager source revision",
-        trusted_manager is not None
-        and payload.get("isolated_manager_source_revision")
-        == result.get("manager_source_revision")
-        == trusted_manager,
-        f"attestation={payload.get('isolated_manager_source_revision')} "
-        f"result={result.get('manager_source_revision')} installed={trusted_manager}",
-    )
-
     # execution identity는 **history**에서 찾는다. `current`만 보면 이 검증기 자신을
     # 배포하는 순간(= rebind로 새 identity가 생기는 순간) 그 이전 leaf가 전부
     # 검증 불가가 된다 — 검증기가 자기가 배포되기 전의 증적을 영원히 못 보는
@@ -2377,6 +2363,10 @@ def verify_leaf(leaf: Path) -> int:
     # `current` 여부는 통과 조건이 아니라 **보고 대상**이다. Manager 업그레이드는
     # 정당하게 identity를 바꾸며, 그것이 과거 증적을 무효화하지는 않는다.
     leaf_identity = payload.get("isolated_execution_identity_sha256")
+    try:
+        trusted_manager: str | None = trusted_manager_source_revision()
+    except (DeploymentContractError, OSError, ValueError):
+        trusted_manager = None
     try:
         execution = load_runtime_execution_registry()
         bindings = (execution.current, *execution.history)
@@ -2403,6 +2393,25 @@ def verify_leaf(leaf: Path) -> int:
         and leaf_identity == result.get("execution_identity_sha256"),
         f"attestation={leaf_identity} result={result.get('execution_identity_sha256')} "
         f"registry_binding={'found' if bound else 'absent'} is_current={is_current}",
+    )
+
+    # Manager revision도 **그 binding에서** 파생한다. 설치된 revision과 대조하면
+    # L5와 똑같은 이유로 깨진다 — 이 검증기를 배포하는 순간 설치 revision이 바뀌어
+    # 자기 배포 이전 leaf를 영원히 못 본다(2026-09-07 n150 실측: L5는 고쳤는데 L4가
+    # 같은 결함을 그대로 들고 있어 승격 후보가 거부됐다).
+    #
+    # 설치된 revision과의 일치 여부는 **보고 대상**이다. Manager 업그레이드는 과거
+    # 증적을 무효화하지 않는다.
+    record(
+        "L4 Manager source revision",
+        bound is not None
+        and payload.get("isolated_manager_source_revision")
+        == result.get("manager_source_revision")
+        == bound.manager_source_revision,
+        f"attestation={payload.get('isolated_manager_source_revision')} "
+        f"result={result.get('manager_source_revision')} "
+        f"binding={getattr(bound, 'manager_source_revision', None)} "
+        f"installed={trusted_manager} is_installed={trusted_manager == result.get('manager_source_revision')}",
     )
 
     record(
