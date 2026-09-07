@@ -3036,6 +3036,200 @@ def test_rotation_preflight_refuses_a_non_hex_revision(monkeypatch, capsys) -> N
     assert called == []
 
 
+
+def _verify_leaf_fixture(
+    tmp_path,
+    driver,
+    *,
+    identity_in_history: bool,
+    history_pinset: str | None = None,
+    result_identity: str | None = None,
+):
+    """`--verify-leaf`가 읽는 leaf 한 벌과 그에 맞는 registry 대역을 만든다."""
+
+    import hashlib as _hashlib
+
+    pinned = PINNED_RUNTIME_RELEASE
+    map_revision = pinned.source_for("map").revision
+    pinvi_revision = pinned.source_for("pinvi").revision
+    manager_revision = "b" * 40
+    identity = "c" * 64
+
+    leaf = tmp_path / "leaf"
+    (leaf / "runtime" / "m04").mkdir(parents=True)
+    (leaf / "runtime" / "m05").mkdir(parents=True)
+
+    provenance = {
+        "kind": "m05-isolated-runtime-provenance-v1",
+        "map": {"source_revision": map_revision},
+        "pinvi": {"source_revision": pinvi_revision},
+    }
+    attestation = {
+        "payload": {
+            "isolated_pinset_sha256": pinned.pinset_sha256,
+            "isolated_manager_source_revision": manager_revision,
+            "isolated_execution_identity_sha256": identity,
+            "m04_server_side_chain_verified": True,
+        },
+        "signature": "unused",
+    }
+    m04 = {"payload": {"scope": "isolated"}, "signature": "unused"}
+
+    def write(path, value):
+        raw = json.dumps(value).encode()
+        path.write_bytes(raw)
+        return _hashlib.sha256(raw).hexdigest()
+
+    provenance_sha = write(leaf / "runtime/isolated-runtime-provenance.json", provenance)
+    attestation_sha = write(leaf / "runtime/m05/attestation.json", attestation)
+    m04_sha = write(leaf / "runtime/m04/m04-attestation.json", m04)
+    (leaf / "result.json").write_bytes(
+        json.dumps(
+            {
+                "harness": driver._HARNESS_NAME,
+                "status": "passed",
+                "phase": "completed",
+                "pinset_sha256": pinned.pinset_sha256,
+                "manager_source_revision": manager_revision,
+                "execution_identity_sha256": result_identity or identity,
+                "m04_attestation_sha256": m04_sha,
+                "m05_attestation_sha256": attestation_sha,
+                "runtime_provenance_sha256": provenance_sha,
+            }
+        ).encode()
+    )
+
+    class _Binding:
+        def __init__(
+            self, execution_identity_sha256: str, *, pinset: str | None = None
+        ) -> None:
+            self.execution_identity_sha256 = execution_identity_sha256
+            self.source_pinset_sha256 = pinset or pinned.pinset_sha256
+            self.map_revision = map_revision
+            self.pinvi_revision = pinvi_revision
+
+    class _Registry:
+        # 검증 대상 leaf의 identity는 **history**에만 있고 current는 다른 값이다 —
+        # Manager를 업그레이드한 뒤의 실제 상태가 정확히 이 모양이다.
+        current = _Binding("d" * 64)
+        history = (
+            (_Binding(identity, pinset=history_pinset),) if identity_in_history else ()
+        )
+
+        @staticmethod
+        def is_unconditionally_blocked_current() -> bool:
+            return False
+
+    class _Pins:
+        @staticmethod
+        def is_unconditionally_blocked_pinset(_sha: str) -> bool:
+            return False
+
+    return leaf, manager_revision, _Registry, _Pins
+
+
+def test_verify_leaf_accepts_an_identity_that_is_only_in_registry_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """검증기는 자기가 배포되기 **전에** 만들어진 leaf를 볼 수 있어야 한다.
+
+    `current`만 보면 이 검증기를 배포하는 순간(= rebind로 새 execution identity가
+    생기는 순간) 그 이전 leaf가 전부 검증 불가가 된다 — 검증기가 자기 배포 이전의
+    증적을 영원히 못 보는 구조다. registry history는 append-only이고 각 binding이
+    pinset·Map·PinVi revision을 함께 들고 있으므로, "그 identity가 **지금 고정된
+    pair**에 결박된 것이었는가"를 다시 계산할 수 있다.
+    """
+    driver = _driver()
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 0
+    out = capsys.readouterr().out
+    assert "leaf verification PASSED" in out
+    # current가 아니라는 사실은 **보고**되되 통과를 막지 않는다.
+    assert "is_current=False" in out
+
+
+def test_verify_leaf_refuses_an_identity_bound_to_no_pinned_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """history에도 없는 identity는 거부한다 — 넓힌 것은 '어디서 찾는가'이지 결박이 아니다."""
+    driver = _driver()
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=False
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "L5 execution identity" in capsys.readouterr().out
+
+
+def test_verify_leaf_refuses_history_bound_to_another_pinset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """history에서 찾더라도 그 binding이 **지금 고정된 pair**의 것이어야 한다.
+
+    넓힌 것은 "어디서 찾는가"이지 결박이 아니다. 다른 pinset에 결박됐던 identity를
+    받아 주면 "이 leaf가 현재 고정된 pair의 증적이다"라는 통과의 뜻이 사라진다.
+    """
+    driver = _driver()
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, history_pinset="e" * 64
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "L5 execution identity" in capsys.readouterr().out
+
+
+def test_verify_leaf_refuses_attestation_and_result_identity_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """attestation과 `result.json`이 서로 다른 identity를 말하면 거부한다.
+
+    leaf 안에서 두 문서가 갈라지는 것은 그 자체로 증적이 아니다.
+    """
+    driver = _driver()
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, result_identity="f" * 64
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "L5 execution identity" in capsys.readouterr().out
+
+
+def test_verify_leaf_recomputes_the_hash_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """`result.json`의 해시는 **다시 계산해서** 대조한다 — 적힌 값을 믿지 않는다."""
+    driver = _driver()
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    target = leaf / "runtime/m05/attestation.json"
+    tampered = json.loads(target.read_bytes())
+    tampered["payload"]["m04_server_side_chain_verified"] = True
+    tampered["signature"] = "tampered"
+    target.write_bytes(json.dumps(tampered).encode())
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "runtime/m05/attestation.json" in capsys.readouterr().out
+
 def test_pair_failures_carry_a_closed_vocabulary_diagnostic() -> None:
     """`pair_contract_invalid` 15곳이 전부 진단 없이 같은 문자열만 냈다.
 
