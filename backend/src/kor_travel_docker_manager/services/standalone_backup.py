@@ -1430,7 +1430,14 @@ def _pg_dump_already_running(
 #:
 #: **role에 무관하다** — 특정 프로젝트의 relation 이름을 알지 않고 카탈로그를 그대로
 #: 훑는다(Manager 범용성 유지).
+#: `search_path`를 **고정한다.** `pg_get_function_identity_arguments()`는 세션의
+#: `search_path`에 따라 타입을 `geometry`로도 `x_extension.geometry`로도 렌더링한다.
+#: 운영 DB의 세션은 `x_extension`을 path에 갖고 scratch DB는 안 갖는 것이 기본이라,
+#: 고정하지 않으면 **소유권·ACL이 완전히 같은데도** 지문이 달라진다 — n150 실측에서
+#: PostGIS 함수 495건이 그 이유만으로 어긋났다(2026-09-08). 거짓 양성은 진짜 drift를
+#: 덮으므로 없는 것보다 나쁘다.
 _CATALOG_DIGEST_SQL = """
+SET LOCAL search_path = pg_catalog;
 SELECT string_agg(line, E'
 ' ORDER BY line) FROM (
     SELECT format('r|%s|%s|%s|%s|%s',
