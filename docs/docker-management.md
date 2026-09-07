@@ -1347,3 +1347,43 @@ sudo -n backend/.venv/bin/ktdctl offbox-sync status --json   # root 불필요, �
   Dashboard의 "설정됐지만 아직 실행한 적이 없습니다" 배지가 이 상태를 알린다.
 - 위 실측 표의 수치는 **일 1회가 가능하다**는 것만 보여준다. Map 쪽 최종 주기화
   여부는 kor-travel-map #148이 소유하며, 이 wrapper는 Map role을 주기 실행하지 않는다.
+
+### 복원 리허설 실측 기록 (2026-09-07)
+
+Map 원장 `T-VN-H49-{GEO-DAGSTER,CONCIERGE,PINVI}`의 마지막 해제 조건이 "복원 리허설
+1회와 그 기록"이었다. 기록 위치는 소유자 판정으로 **이 runbook**이다 — Map
+`docs/backup-restore.md`가 "n150 운영 backup은 Docker Manager runbook이 정본"이라고
+스스로 위임하고 있어 그 위임을 따른다.
+
+**리허설이 그동안 한 번도 성공한 적이 없었다.** `docker cp`가 host 파일의 소유권을
+보존하는데(백업은 `root:root 0600`) `pg_restore`는 컨테이너 안 `postgres`(uid 999)로
+돈다 — 넘겨받지 못한 파일을 읽으려 했다. 모든 백업이 root 0600이라 role을 바꿔도
+결과가 같았다. copy-in 직후 소유권을 복원 유저에게 넘기도록 고친 뒤 아래를 얻었다
+(모드 `0600`은 그대로 두고 소유자만 바꾼다).
+
+| role | backup | 리허설 | alembic head | 복원 크기 |
+|---|---|---|---|---|
+| `pinvi` | 기존(2026-08-25) | `verified: true` | `20260821_0061` | 12,104,163 B |
+| `geo_dagster` | 이번에 생성 | `verified: true` | `29b539ebc72a` | 59,847,139 B |
+| `concierge` | 이번에 생성 | `verified: true` | `20260901_0029` | 78,918,115 B |
+
+셋 다 scratch DB로 복원해 schema revision·크기를 확인하고 정리했다. **운영 DB는
+건드리지 않았다.** `pinvi`는 `HEAD_MISMATCH`(백업 시점 `20260821_0061` vs 현재
+`20260824_0101`)를 비차단 finding으로 냈다 — 복원하면 코드가 기대하는 schema보다
+과거로 돌아간다는 뜻이고, 리허설 자체의 성립을 막지는 않는다.
+
+**함께 드러난 것 — 이 host에 예약 백업이 없다.**
+
+`geo_dagster`와 `concierge`는 백업이 **0건**이어서 `create`가 선행해야 했다. 확인해
+보니 원인이 있다:
+
+- `crontab -l`(root) → `no crontab for root`
+- backup systemd timer 없음(`dpkg-db-backup.timer`는 Debian 자체 기능이다)
+- `/etc/logrotate.d/`에 kor-travel 항목 없음 — `/opt/kor-travel-docker-manager/.env`에
+  `KTDM_BACKUP_ROOT`가 없어 trusted installer의 `install_backup_logrotate()`가 skip됐다
+- 백업이 있는 role은 `map_application` 1건, `map_dagster` 1건, `pinvi` 2건뿐이고
+  전부 수동 생성분이다
+
+즉 "주기 백업이 최근 성공과 bounded retention으로 수렴한다"는 전제는 **수렴할 대상이
+돌지 않는 상태**다. 이 축은 Map `T-VN-H49-OFFBOX`가 소유한다(목적지 호스트·계정·ssh
+키가 운영자 몫이고, 그 뒤 env 4개와 root crontab 한 줄이다).
