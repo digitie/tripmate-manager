@@ -3054,6 +3054,11 @@ def _verify_leaf_fixture(
     m04_attestation_sha: str | None = None,
     ledger_claim: bool = True,
     blocked_phases: tuple[str | None, ...] = (),
+    status: str = "passed",
+    leaf_pinset: str | None = None,
+    provenance_map_revision: str | None = None,
+    m04_chain_verified: bool = True,
+    provenance_identity: str | None = None,
 ):
     """`--verify-leaf`가 읽는 leaf 한 벌과 그에 맞는 registry 대역을 만든다."""
 
@@ -3079,17 +3084,24 @@ def _verify_leaf_fixture(
     for directory in (leaf, leaf / "runtime", leaf / "runtime/m04", leaf / "runtime/m05"):
         directory.chmod(0o700)
 
+    transaction_id = "a1" * 16
     provenance = {
         "kind": "m05-isolated-runtime-provenance-v1",
-        "map": {"source_revision": map_revision},
+        "map": {"source_revision": provenance_map_revision or map_revision},
         "pinvi": {"source_revision": pinvi_revision},
+        # 아래 넷이 L6b가 결박하는 축이다 — 실제 provenance 문서가 들고 있는 것과
+        # 같은 키다(n150 실측으로 확인).
+        "execution_identity_sha256": provenance_identity or (result_identity or identity),
+        "manager_source_revision": result_manager or manager_revision,
+        "pinset_sha256": leaf_pinset or pinned.pinset_sha256,
+        "transaction_id": transaction_id,
     }
     attestation = {
         "payload": {
-            "isolated_pinset_sha256": pinned.pinset_sha256,
+            "isolated_pinset_sha256": leaf_pinset or pinned.pinset_sha256,
             "isolated_manager_source_revision": attestation_manager or manager_revision,
             "isolated_execution_identity_sha256": identity,
-            "m04_server_side_chain_verified": True,
+            "m04_server_side_chain_verified": m04_chain_verified,
             # M04 증적을 사슬에 넣는 결박. 아래에서 실제 해시로 덮어쓴다.
             "m04_attestation_sha256": None,
         },
@@ -3113,9 +3125,10 @@ def _verify_leaf_fixture(
         json.dumps(
             {
                 "harness": driver._HARNESS_NAME,
-                "status": "passed",
+                "status": status,
                 "phase": "completed",
-                "pinset_sha256": pinned.pinset_sha256,
+                "pinset_sha256": leaf_pinset or pinned.pinset_sha256,
+                "transaction_id": transaction_id,
                 "manager_source_revision": result_manager or manager_revision,
                 "execution_identity_sha256": result_identity or identity,
                 "m04_attestation_sha256": m04_sha,
@@ -3965,11 +3978,35 @@ def test_leaf_ledger_claim_name_matches_the_planner(tmp_path: Path) -> None:
     from kor_travel_docker_manager.services.m05_isolated_harness import (
         M05_ISOLATED_HARNESS_KIND,
         M05_ISOLATED_HARNESS_VERSION,
+        M05IsolatedHarnessPlan,
     )
 
     driver = _driver()
     assert driver._HARNESS_NAME == M05_ISOLATED_HARNESS_KIND
     assert driver._HARNESS_VERSION == M05_ISOLATED_HARNESS_VERSION
+
+    # **planner를 실제로 부른다.** 앞선 판(4차 적대 리뷰가 잡았다)은 payload와
+    # 직렬화를 테스트 본문에 손으로 다시 적어 비교했다 — 결박이 아니라 세 번째
+    # 손복사본이었다. planner가 키를 더하거나 separators/sort_keys/끝 개행을 바꾸면
+    # 검증기와 테스트는 둘 다 초록인 채 실제 ledger 파일명만 갈라지고, L9는 소리
+    # 없이 항상 FAIL이 된다.
+    plan = M05IsolatedHarnessPlan(
+        release=PINNED_RUNTIME_RELEASE,
+        manager_source_revision="b" * 40,
+        execution_identity_sha256=ExecutionIdentityV6.build(
+            source_pinset_sha256=PINNED_RUNTIME_RELEASE.pinset_sha256,
+            manager_source_revision="b" * 40,
+        ).execution_identity_sha256,
+        transaction_id="0" * 32,
+    )
+    assert (
+        driver._leaf_ledger_claim_name(
+            manager_source_revision=plan.manager_source_revision,
+            execution_identity_sha256=plan.execution_identity_sha256,
+            pinset_sha256=PINNED_RUNTIME_RELEASE.pinset_sha256,
+        )
+        == plan.ledger_filename
+    )
 
     payload = {
         "harness": M05_ISOLATED_HARNESS_KIND,
@@ -4101,3 +4138,98 @@ def test_verify_leaf_does_not_tie_a_past_leaf_to_the_current_identity_burn(
 
     assert driver.verify_leaf(leaf) == 0
     assert "leaf_execution_blocked=False" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_fail"),
+    [
+        ({"status": "failed"}, "L1 harness/status/phase"),
+        ({"leaf_pinset": "f" * 64}, "L3 pinset"),
+        ({"provenance_map_revision": "e" * 40}, "L6 Map/PinVi source revision"),
+        ({"m04_chain_verified": False}, "L7 M04 server-side chain"),
+    ],
+)
+def test_verify_leaf_refuses_each_remaining_axis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    kwargs: dict[str, object],
+    expected_fail: str,
+) -> None:
+    """L1·L3·L6·L7도 각각 고립해서 잰다.
+
+    4차 적대 리뷰가 잡았다 — 이 넷은 술어를 `True`로 바꿔도 전 테스트가 초록이었다.
+    특히 **L3이 "pin이 움직이면 같은 leaf가 다시 통과하지 않는다"를 지는 축**인데,
+    기존 pinset 테스트는 *binding*의 pinset만 바꿔 L5가 먼저 잡고 L3은 건드려지지
+    않았다. 여기서는 leaf 쪽 pinset을 어긋내 L3만 떨어뜨린다.
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, **kwargs
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    out = capsys.readouterr().out
+    assert f"FAIL {expected_fail}" in out
+
+
+def test_verify_leaf_requires_the_exact_private_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """모드는 "group/other에 닫혀 있다"가 아니라 **정확히** 0600/0700이어야 한다.
+
+    `& 0o077 == 0`만 보면 0500·0400 같은 임의의 owner-only 모드를 받는다. 드라이버가
+    쓰는 것은 0600(파일)·0700(디렉터리)뿐이라 정확 대조가 맞고, 그래야
+    `_secure_read_root_file`이 이미 요구하던 규율과 같아진다(4차 적대 리뷰 P1).
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+    assert driver.verify_leaf(leaf) == 0
+
+    # owner-only지만 0600이 아니다 — `& 0o077`로는 잡히지 않는다.
+    (leaf / "result.json").chmod(0o400)
+    assert driver.verify_leaf(leaf) == 1
+    (leaf / "result.json").chmod(0o600)
+
+    # 디렉터리도 마찬가지 — 0500은 owner-only지만 0700이 아니다.
+    leaf.chmod(0o500)
+    assert driver.verify_leaf(leaf) == 1
+    leaf.chmod(0o700)
+    assert driver.verify_leaf(leaf) == 0
+    capsys.readouterr()
+
+
+def test_verify_leaf_refuses_a_provenance_from_another_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """provenance 문서가 **이 실행의 것**이어야 한다.
+
+    종전에는 파일을 열어 놓고 map/pinvi revision 둘만 쓰고, 그 문서가 이미 들고 있는
+    `execution_identity_sha256`·`manager_source_revision`·`pinset_sha256`·
+    `transaction_id` 넷을 버렸다 — 다른 실행이 만든 provenance를 끼운 leaf가 L6을
+    그대로 통과했다(해시 사슬은 leaf 내부 자기정합만 본다). 4차 적대 리뷰 P1.
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, provenance_identity="9" * 64
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "FAIL L6b provenance가 이 실행의 것이다" in capsys.readouterr().out

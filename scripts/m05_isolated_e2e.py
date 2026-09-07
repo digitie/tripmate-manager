@@ -2471,6 +2471,7 @@ def verify_leaf(leaf: Path) -> int:
             name="isolated runtime provenance",
         )
         provenance_map = _leaf_object(provenance.get("map"), name="provenance map")
+        provenance_pinvi = _leaf_object(provenance.get("pinvi"), name="provenance pinvi")
     except (KeyError, OSError, TypeError, ValueError):
         print("leaf attestation/provenance is unreadable", flush=True)
         return 1
@@ -2575,7 +2576,33 @@ def verify_leaf(leaf: Path) -> int:
         if isinstance(provenance.get("pinvi"), dict)
         else False,
         f"provenance map={provenance_map.get('source_revision')} "
-        f"registry map={map_source.revision}",
+        f"pinvi={provenance_pinvi.get('source_revision')} "
+        f"registry map={map_source.revision} pinvi={pinvi_source.revision}",
+    )
+
+    # provenance 문서는 `execution_identity_sha256`·`manager_source_revision`·
+    # `pinset_sha256`·`transaction_id`를 **이미 들고 있다.** 종전에는 파일을 열어
+    # 놓고 map/pinvi revision 둘만 쓰고 나머지 넷을 버렸다 — 그래서 **다른 실행이
+    # 만든 provenance 문서**를 끼운 leaf가 L6을 그대로 통과했다(해시 사슬은 leaf
+    # 내부 자기정합만 본다). 4차 적대 리뷰가 "2차 P0-3과 같은 species"라 불렀다.
+    #
+    # `transaction_id`는 실행마다 `secrets.token_hex(16)`이라 **예측 불가**다 —
+    # 이 축이 provenance를 그 실행에 묶는 유일한 값이다.
+    provenance_binding = {
+        "execution_identity_sha256": provenance.get("execution_identity_sha256"),
+        "manager_source_revision": provenance.get("manager_source_revision"),
+        "pinset_sha256": provenance.get("pinset_sha256"),
+        "transaction_id": provenance.get("transaction_id"),
+    }
+    result_binding = {key: result.get(key) for key in provenance_binding}
+    record(
+        "L6b provenance가 이 실행의 것이다",
+        all(value is not None for value in provenance_binding.values())
+        and provenance_binding == result_binding,
+        " ".join(
+            f"{key}={provenance_binding[key]}=={result_binding[key]}"
+            for key in sorted(provenance_binding)
+        ),
     )
 
     record(
