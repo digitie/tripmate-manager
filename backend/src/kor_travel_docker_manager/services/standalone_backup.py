@@ -1443,7 +1443,15 @@ SELECT string_agg(line, E'
     SELECT format('r|%s|%s|%s|%s|%s',
         n.nspname, c.relname, c.relkind,
         pg_get_userbyid(c.relowner),
-        coalesce(array_to_string(c.relacl::text[], ','), '')
+        array_to_string(
+            coalesce(
+                c.relacl,
+                acldefault(
+                    CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END, c.relowner
+                )
+            )::text[],
+            ','
+        )
     ) AS line
     FROM pg_catalog.pg_class AS c
     JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
@@ -1454,7 +1462,9 @@ SELECT string_agg(line, E'
         n.nspname, p.proname,
         pg_catalog.pg_get_function_identity_arguments(p.oid),
         pg_get_userbyid(p.proowner), p.prosecdef,
-        coalesce(array_to_string(p.proacl::text[], ','), '')
+        array_to_string(
+            coalesce(p.proacl, acldefault('f', p.proowner))::text[], ','
+        )
     )
     FROM pg_catalog.pg_proc AS p
     JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
@@ -1462,7 +1472,9 @@ SELECT string_agg(line, E'
     UNION ALL
     SELECT format('n|%s|%s|%s',
         n.nspname, pg_get_userbyid(n.nspowner),
-        coalesce(array_to_string(n.nspacl::text[], ','), '')
+        array_to_string(
+            coalesce(n.nspacl, acldefault('n', n.nspowner))::text[], ','
+        )
     )
     FROM pg_catalog.pg_namespace AS n
     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
