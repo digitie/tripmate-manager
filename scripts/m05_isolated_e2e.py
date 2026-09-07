@@ -2248,6 +2248,9 @@ def rotation_preflight(map_revision: str, pinvi_revision: str) -> int:
 
 #: leaf가 스스로 밝히는 하네스 이름. 결과 기록과 검증이 같은 상수를 쓴다 —
 #: 두 곳에 리터럴로 적으면 한쪽만 바뀌어도 검증이 조용히 통과한다.
+import re as _re
+
+_SHA256_HEX = _re.compile(r"[0-9a-f]{64}")
 _HARNESS_NAME = "m05-isolated-bridge-v1"
 _HARNESS_VERSION = 1
 
@@ -2290,7 +2293,7 @@ class _UntrustedLeaf(Exception):
     """leaf가 특권 생산자의 산물이라는 증거가 없다."""
 
 
-def _trusted_leaf_bytes(path: Path) -> bytes:
+def _trusted_leaf_bytes(path: Path, *, mode: int = 0o600) -> bytes:
     """leaf 파일을 **소유자·권한·symlink를 확인하고** 한 번만 읽는다.
 
     종전에는 `path.open("rb")`였다 — symlink를 그대로 따라가고 소유자도 mode도
@@ -2334,10 +2337,15 @@ def _trusted_leaf_bytes(path: Path) -> bytes:
             raise _UntrustedLeaf(
                 f"{path.name}: 검증기를 돌리는 신원의 소유가 아니다(uid={opened.st_uid})"
             )
-        if stat.S_IMODE(opened.st_mode) & 0o077:
+        if stat.S_IMODE(opened.st_mode) != mode:
             raise _UntrustedLeaf(
-                f"{path.name}: mode {stat.S_IMODE(opened.st_mode):04o} — group/other에 열려 있다"
+                f"{path.name}: mode {stat.S_IMODE(opened.st_mode):04o} != {mode:04o}"
             )
+        # 하드링크는 같은 inode를 다른 디렉터리에서 계속 바꿀 수 있게 한다 —
+        # `_root_file`/`_secure_read_root_file`이 이미 요구하는 조건인데 처음
+        # 옮길 때 빠뜨렸다(3차 적대 리뷰 P1).
+        if opened.st_nlink != 1:
+            raise _UntrustedLeaf(f"{path.name}: 하드링크가 있다(nlink={opened.st_nlink})")
         chunks: list[bytes] = []
         while chunk := os.read(fd, 1024 * 1024):
             chunks.append(chunk)
@@ -2365,9 +2373,9 @@ def _assert_trusted_leaf_root(leaf: Path) -> None:
         raise _UntrustedLeaf(
             f"{leaf}: 검증기를 돌리는 신원의 소유가 아니다(uid={metadata.st_uid})"
         )
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
         raise _UntrustedLeaf(
-            f"{leaf}: mode {stat.S_IMODE(metadata.st_mode):04o} — group/other에 열려 있다"
+            f"{leaf}: mode {stat.S_IMODE(metadata.st_mode):04o} != 0700"
         )
 
 
@@ -2407,6 +2415,9 @@ def verify_leaf(leaf: Path) -> int:
 
     try:
         _assert_trusted_leaf_root(leaf)
+        for relative in sorted({str(Path(value).parent) for value in _LEAF_HASHED_ARTIFACTS.values()}):
+            if relative != ".":
+                _assert_trusted_leaf_root(leaf / relative)
         result = _leaf_object(
             json.loads(_trusted_leaf_bytes(leaf / "result.json")), name="leaf result"
         )
@@ -2416,7 +2427,11 @@ def verify_leaf(leaf: Path) -> int:
     except (OSError, TypeError, ValueError):
         print("leaf result.json is unreadable", flush=True)
         return 1
-    record("L0 leaf 신뢰 경계", True, f"root-owned 비공개 디렉터리 {leaf}")
+    record(
+        "L0 leaf 신뢰 경계",
+        True,
+        f"root-owned 0700 트리 {leaf} (증적 하위 디렉터리 포함)",
+    )
 
     record(
         "L1 harness/status/phase",
@@ -2432,7 +2447,10 @@ def verify_leaf(leaf: Path) -> int:
     for field, relative in _LEAF_HASHED_ARTIFACTS.items():
         try:
             raw = _trusted_leaf_bytes(leaf / relative)
-        except _UntrustedLeaf as error:
+        except (_UntrustedLeaf, OSError) as error:
+            # `OSError`도 잡는다 — lstat 통과 뒤 최종 컴포넌트가 symlink로 바뀌면
+            # `O_NOFOLLOW`가 ELOOP를 낸다. 좁히면 그 실패가 `FAIL L2` 없이
+            # traceback으로만 나가 "이유 없는 exit 1"이 된다(3차 적대 리뷰 P1).
             record(f"L2 {relative}", False, f"신뢰 읽기 실패: {error}")
             continue
         hashed_bytes[field] = raw
@@ -2487,13 +2505,26 @@ def verify_leaf(leaf: Path) -> int:
     try:
         execution = load_runtime_execution_registry()
         bindings = (execution.current, *execution.history)
-        # **leaf 자신의** identity가 차단됐는지를 본다. 종전에는 `current`만 봤는데
-        # 승격 후보는 둘 다 current가 아닌 identity라, 그 leaf가 소각됐어도 L8이
-        # 통과했다(2026-09-07 적대 리뷰 P0).
+        # **leaf 자신의** identity가 **무조건** 차단됐는지를 본다.
+        #
+        # `phase is None` 필터가 없으면 안 된다 — `blocked_executions`는 무조건
+        # 소각과 phase-scoped 기록을 **한 리스트에 함께** 담고, 정본
+        # (`RuntimeExecutionRegistry.is_unconditionally_blocked_current`)이 바로 그
+        # 필터로 둘을 가른다. 인프라 phase 실패는 scoped 기록만 남기고 보정 후
+        # 재실행이 가능한데(그것이 phase-scoped 설계의 요지다, 이 파일 위쪽 주석
+        # 참조), 필터 없이 보면 **그 뒤에 정당하게 통과한 leaf가 영원히 검증
+        # 불가**가 된다. execution identity는 (pinset, manager)에서 파생하므로
+        # Manager를 안 바꾼 재시도는 같은 identity라 이 경로가 실제로 열린다
+        # (2026-09-07 3차 적대 리뷰 P0 — #330이 넣은 회귀).
+        #
+        # `current`의 소각은 **보지 않는다.** leaf와 무관한 다음 실행 하나가
+        # 실패하면 history의 모든 증적이 즉시 검증 불가가 되는데, 그것은 L4·L5가
+        # 세운 원칙("Manager 업그레이드는 과거 증적을 무효화하지 않는다")과 정면으로
+        # 어긋난다(같은 리뷰 P1).
         execution_blocked = any(
-            entry.execution_identity_sha256 == leaf_identity
+            entry.execution_identity_sha256 == leaf_identity and entry.phase is None
             for entry in execution.blocked_executions
-        ) or execution.is_unconditionally_blocked_current()
+        )
         is_current = execution.current.execution_identity_sha256 == leaf_identity
         bound = next(
             (
@@ -2557,11 +2588,17 @@ def verify_leaf(leaf: Path) -> int:
     # **한 번도 열지 않았다.** m05 attestation payload가 이미 `m04_attestation_sha256`을
     # 들고 있으므로 그것을 L2가 재계산한 값과 대조하면 M04가 사슬에 들어온다
     # (2026-09-07 적대 리뷰 P0-3: "공짜로 쓸 수 있는 결박을 버렸다").
+    # hex 요구는 **심층 방어**다. `result`의 그 키가 hex가 아니면 L2가 먼저
+    # FAIL하므로 이 축만 따로 뒤집는 변이를 만들 수 없다(시도했고 초록이었다).
+    # 파일별 uid 검사와 같은 성질이라 가짜 게이트 대신 사실을 적는다 — 이 줄이
+    # 지키는 것은 L2가 우회됐을 때뿐이고, L7b를 자족적으로 만드는 값이 있다.
+    m04_bound = payload.get("m04_attestation_sha256")
     record(
         "L7b M04 증적이 사슬 안에 있다",
-        payload.get("m04_attestation_sha256") == result.get("m04_attestation_sha256"),
-        f"attestation={payload.get('m04_attestation_sha256')} "
-        f"result={result.get('m04_attestation_sha256')}",
+        isinstance(m04_bound, str)
+        and _SHA256_HEX.fullmatch(m04_bound) is not None
+        and m04_bound == result.get("m04_attestation_sha256"),
+        f"attestation={m04_bound} result={result.get('m04_attestation_sha256')}",
     )
 
     # **닻.** L3~L6이 대조하는 값은 전부 `-public` 사본에서 world-readable이라
