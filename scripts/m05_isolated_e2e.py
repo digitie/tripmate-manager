@@ -2573,7 +2573,7 @@ def verify_leaf(leaf: Path) -> int:
     claim = _leaf_ledger_claim_name(
         manager_source_revision=str(result.get("manager_source_revision") or ""),
         execution_identity_sha256=str(leaf_identity or ""),
-        pinset_sha256=str(result.get("source_pinset_sha256") or ""),
+        pinset_sha256=str(result.get("pinset_sha256") or ""),
     )
     try:
         _assert_trusted_leaf_root(_LEDGER)

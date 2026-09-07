@@ -3112,7 +3112,6 @@ def _verify_leaf_fixture(
                 "m04_attestation_sha256": m04_sha,
                 "m05_attestation_sha256": attestation_sha,
                 "runtime_provenance_sha256": provenance_sha,
-                "source_pinset_sha256": pinned.pinset_sha256,
             }
         ).encode()
     )
