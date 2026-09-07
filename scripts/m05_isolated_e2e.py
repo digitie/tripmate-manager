@@ -1772,6 +1772,8 @@ _PAIR_DIAGNOSTICS: frozenset[str] = frozenset(
         "pair contract version is unsupported",
         "pair contract v2 must not declare a source revision",
         "pair source blob digest differs from the pinned release",
+        "Map service provenance contract is unreadable",
+        "Map service release revision is not a 40-hex commit",
         # `_source_pair_preflight`가 이미 쓰던 셋. 같은 phase를 내므로 같은
         # 어휘에 들어와야 preflight가 이것도 내보인다.
         "committed pinned-runtime generation manifest unavailable",
@@ -1791,10 +1793,55 @@ def _sha256_text(value: object) -> str:
     return value
 
 
+#: 이 파일이 인용하는 `T-VN-PAIR-V2`의 정본 문서는 **Map 저장소**의
+#: `docs/tasks-acceptance.md` 같은 이름 절이다(v1 분기를 언제 뗄지가 §7에 있다).
+#: PinVi가 vendoring하는 pair 계약의 저장소 내 경로.
+_PAIR_CONTRACT_PATH = "contracts/kor-travel-map-m05-pair-provenance-v1.json"
+
+#: service 표면의 릴리스 revision **정본**. PinVi `config.py`가 컨테이너 부팅 때
+#: 이 값과 env를 대조하므로, 하네스가 env에 넣는 값도 여기서 나와야 한다.
+_SERVICE_PROVENANCE_PATH = "contracts/kor-travel-map-service-provenance-v1.json"
+
+
+def _service_release_revision(pinvi_root: Path) -> str:
+    """service 릴리스 revision을 그 값의 정본 문서에서 읽는다."""
+
+    try:
+        document = json.loads(
+            (pinvi_root / _SERVICE_PROVENANCE_PATH).read_text(encoding="utf-8")
+        )
+        revision = document["map_release_revision"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        _fail(
+            "pair_contract_invalid",
+            diagnostic="Map service provenance contract is unreadable",
+        )
+    if (
+        not isinstance(revision, str)
+        or len(revision) != _REVISION_LENGTH
+        or any(char not in "0123456789abcdef" for char in revision)
+    ):
+        _fail(
+            "pair_contract_invalid",
+            diagnostic="Map service release revision is not a 40-hex commit",
+        )
+    return revision
+
+#: pair 계약의 네 표면이 Map source의 어느 파일에서 나오는지. 격리 e2e의 `_pair`와
+#: 회전 preflight가 **같은 한 곳**에서 읽는다 — 두 곳에 따로 적으면 표면이 늘 때
+#: 한쪽만 늘어난다(`AGENTS.md` DO NOT 15).
+_PAIR_SURFACE_PATHS = {
+    "admin": "packages/kor-travel-map-api/openapi.json",
+    "full": "packages/kor-travel-map-api/openapi.json",
+    "service": "packages/kor-travel-map-api/openapi.service.json",
+    "user": "packages/kor-travel-map-api/openapi.user.json",
+}
+
+
 def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, str, str]:
     """PinVi가 vendoring한 M05 pair를 Map pinned Git blob까지 직접 대조한다."""
 
-    path = pinvi_root / "contracts/kor-travel-map-m05-pair-provenance-v1.json"
+    path = pinvi_root / _PAIR_CONTRACT_PATH
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         mapping = value["map"]
@@ -1877,6 +1924,10 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         # "계약은 자기무모순이다"만 증명했다. v2에서는 네 entry 전부가 릴리스의
         # blob과 대조되므로, service·user 표면이 **처음으로** 릴리스에 결박된다.
         revisions.add(pinned_map_revision)
+        # PinVi attestation은 service 표면을 **그 표면의 릴리스 revision**에서
+        # 읽는다(`_surface_revisions`). 그 object가 checkout에 없으면 하네스가
+        # 다 돌고 난 뒤 `git show`에서 죽는다 — 여기서 함께 보충한다.
+        revisions.add(_service_release_revision(pinvi_root))
     map_hash = _sha256_text(full.get("openapi_sha256"))
     if version == 1:
         # v1에서만 필요한 두 검사다. 계약이 자기 revision을 선언하므로 그것이
@@ -1910,13 +1961,7 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
             map_source.canonical_url,
             pair_revision,
         )
-    paths = {
-        "admin": "packages/kor-travel-map-api/openapi.json",
-        "full": "packages/kor-travel-map-api/openapi.json",
-        "service": "packages/kor-travel-map-api/openapi.service.json",
-        "user": "packages/kor-travel-map-api/openapi.user.json",
-    }
-    for name, relative_path in paths.items():
+    for name, relative_path in _PAIR_SURFACE_PATHS.items():
         entry = mapping[name]
         if not isinstance(entry, dict):
             _fail("pair_contract_invalid", diagnostic="pair entry schema is invalid")
@@ -1987,11 +2032,13 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         if not isinstance(service_source_revision, str):
             _fail("pair_contract_invalid", diagnostic="pair service entry is invalid")
     else:
-        # v2에서 service 표면의 revision도 계약이 아니라 **릴리스**가 정한다.
-        # 이것이 이 전환이 없애는 사본 중 하나다 — 이 값은 PinVi의
-        # `contracts/kor-travel-map-service-provenance-v1.json`에도 같은 사실로
-        # 다시 적혀 있었다.
-        service_source_revision = pinned_map_revision
+        # v2에서 service 표면의 revision을 정하는 것은 pin registry가 **아니다.**
+        # 그 값의 정본은 PinVi의 `kor-travel-map-service-provenance-v1.json`이고,
+        # v1 pair 계약이 그것을 세 번째로 선언하고 있었을 뿐이다. 여기에 pinned
+        # Map revision을 넣으면 PinVi가 부팅 시 거부한다 — `config.py`의
+        # `validate_feature_reference_reconciliation`이 이 값을 그 계약과 대조하고,
+        # 두 값은 재핀 주기가 달라 실제로 갈라져 있다(적대 리뷰 P0).
+        service_source_revision = _service_release_revision(pinvi_root)
     return (
         M05IsolatedPairEvidence(
             map_full_openapi_sha256=map_hash,
@@ -2102,7 +2149,78 @@ def _source_pair_preflight() -> tuple[
     )
 
 
-_PAIR_CONTRACT_PATH = "contracts/kor-travel-map-m05-pair-provenance-v1.json"
+def _rotation_pair_digests(mapping: object, *, map_revision: str) -> int:
+    """v2 계약의 네 표면 digest가 회전 대상 Map revision의 blob과 같은지 본다.
+
+    `_pair`(격리 e2e)가 pinned 릴리스에 대해 하는 대조와 같은 것을, 아직 pin되지
+    않은 회전 대상에 대해 한다. 임시 bare 저장소에 그 revision만 fetch하므로
+    기존 상태를 건드리지 않고 실패해도 남기는 것이 없다.
+    """
+
+    if not isinstance(mapping, dict) or set(mapping) != set(_PAIR_SURFACE_PATHS):
+        print("rotation pair contract inventory is invalid", flush=True)
+        return 1
+    map_source = PINNED_RUNTIME_RELEASE.source_for("map")
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            bare = Path(scratch) / "map.git"
+            _command("/usr/bin/git", "init", "--quiet", "--bare", str(bare))
+            _command(
+                "/usr/bin/git",
+                "-C",
+                str(bare),
+                "fetch",
+                "--no-tags",
+                "--depth",
+                "1",
+                map_source.canonical_url,
+                map_revision,
+            )
+            for name, relative_path in _PAIR_SURFACE_PATHS.items():
+                entry = mapping[name]
+                expected = entry.get("openapi_sha256") if isinstance(entry, dict) else None
+                if (
+                    not isinstance(expected, str)
+                    or len(expected) != 64
+                    or any(char not in "0123456789abcdef" for char in expected)
+                ):
+                    print(f"rotation pair contract {name} digest is not sha256", flush=True)
+                    return 1
+                blob = subprocess.run(
+                    [
+                        "/usr/bin/git",
+                        "-C",
+                        str(bare),
+                        "show",
+                        f"{map_revision}:{relative_path}",
+                    ],
+                    cwd="/",
+                    env=_SAFE_SUBPROCESS_ENV,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if blob.returncode != 0:
+                    print(
+                        f"rotation Map surface is unreadable at the target revision: {name}",
+                        flush=True,
+                    )
+                    return 1
+                actual = hashlib.sha256(blob.stdout).hexdigest()
+                if actual != expected:
+                    # 두 값 모두 공개 digest다 — 비밀이 아니다. 여기서 실제 값을
+                    # 보여 주지 않으면 운영자가 다시 traceback으로 역추적한다.
+                    print(
+                        f"rotation pair contract {name} digest differs from the Map revision: "
+                        f"contract={expected} map={actual}",
+                        flush=True,
+                    )
+                    return 1
+    except (_PhaseError, OSError, RuntimeError, ValueError):
+        print("rotation Map source is unreadable at the target revision", flush=True)
+        return 1
+    return 0
 
 
 def rotation_preflight(map_revision: str, pinvi_revision: str) -> int:
@@ -2163,12 +2281,13 @@ def rotation_preflight(map_revision: str, pinvi_revision: str) -> int:
         print("rotation pair contract schema is invalid", flush=True)
         return 1
     if version == 2:
-        # v2 계약에는 비교할 문자열이 **없다.** revision의 생산자가 pin registry
-        # 하나이므로 회전이 만들 수 있는 모순 자체가 존재하지 않는다 — 이 게이트가
-        # 막던 실패가 구조적으로 사라진 것이다. 격리 preflight는 그래도 네 표면의
-        # digest를 릴리스와 대조하므로 검사가 약해지지도 않는다.
-        print("rotation pair contract is v2; revision is produced by the pin registry", flush=True)
-        return 0
+        # v2 계약에는 비교할 revision 문자열이 없다. 그렇다고 볼 것이 없어지는
+        # 것은 아니다 — v1에서 revision이 하던 역할("이 계약은 저 Map을
+        # 가리킨다")을 v2에서는 **digest가** 한다. 그 대조는 격리 e2e의
+        # `_pair`에도 있지만 그것은 회전·rebuild가 끝난 **뒤**다. 여기서 같은
+        # 대조를 회전 대상 revision에 대해 앞으로 당기지 않으면, v2가 이 게이트가
+        # 막던 71분 소각을 그대로 되살린다(2026-09-02에 실제로 잃은 그 사이클).
+        return _rotation_pair_digests(mapping, map_revision=map_revision)
     if version != 1:
         print(f"rotation pair contract version is unsupported: {version}", flush=True)
         return 1

@@ -2863,12 +2863,60 @@ def _rotation_contract(*, admin: str, full: str, version: int = 1) -> bytes:
     ).encode("utf-8")
 
 
-def _rotation_contract_v2() -> bytes:
-    """v2 봉투 — revision 선언이 없다."""
+#: 회전 대상 Map revision이 내놓는다고 가정하는 표면 blob. 실제 파일 내용이
+#: 무엇이든 상관없다 — 게이트가 보는 것은 "계약의 digest == blob의 digest"다.
+#: 회전 **대상** Map revision. pinned와 다른 값이어야 게이트가 무엇에 앵커돼 있는지
+#: 드러난다 — pinned로 읽어도 통과하는 구현은 이 게이트의 목적을 잃은 것이다.
+_ROTATION_MAP_REVISION = "a" * 40
+_ROTATION_MAP_BLOB = b'{"openapi":"3.1.0"}'
+_ROTATION_MAP_DIGEST = hashlib.sha256(_ROTATION_MAP_BLOB).hexdigest()
 
+
+def _rotation_contract_v2(**overrides: str) -> bytes:
+    """v2 봉투 — revision 선언이 없고 네 표면의 digest만 있다."""
+
+    digests = dict.fromkeys(
+        ("admin", "full", "service", "user"), _ROTATION_MAP_DIGEST
+    )
+    digests.update(overrides)
     return json.dumps(
-        {"map": {name: {"openapi_sha256": "a" * 64} for name in ("admin", "full")}, "version": 2}
+        {
+            "map": {name: {"openapi_sha256": digest} for name, digest in digests.items()},
+            "version": 2,
+        }
     ).encode("utf-8")
+
+
+def _rotation_map_blobs(
+    driver, monkeypatch, *, readable: bool = True
+) -> tuple[list[str], list[tuple[str, ...]]]:
+    """회전 대상 Map revision의 blob 읽기를 대역으로 바꾸고 **대상을 기록**한다.
+
+    `subprocess`를 모듈 속성으로 갈아끼운다 — 실제 `subprocess.run`을 monkeypatch
+    하면 같은 인터프리터의 다른 코드까지 함께 바뀐다.
+
+    반환하는 두 리스트는 게이트가 **무엇을** 읽었는지를 담는다. digest 비교만
+    단언하면 저장소·revision·경로를 잘못 지목해도 초록이다(2차 적대 리뷰).
+    """
+
+    reads: list[str] = []
+    fetches: list[tuple[str, ...]] = []
+
+    class _Result:
+        returncode = 0 if readable else 128
+        stdout = _ROTATION_MAP_BLOB if readable else b""
+
+    class _Subprocess:
+        PIPE = -1
+        DEVNULL = -3
+
+        @staticmethod
+        def run(args: list[str], **_kwargs: object) -> object:
+            reads.append(args[-1])
+            return _Result()
+
+    monkeypatch.setattr(driver, "subprocess", _Subprocess)
+    return reads, fetches
 
 
 def _run_rotation_preflight(
@@ -2958,31 +3006,112 @@ def test_rotation_preflight_refuses_a_contract_whose_admin_and_full_disagree(
     assert "admin" in out and "full" in out
 
 
-def test_rotation_preflight_accepts_v2_without_comparing_revisions(
-    monkeypatch, capsys
-) -> None:
-    """v2에는 비교할 문자열이 없다 — 회전이 만들 수 있는 모순이 사라졌다.
-
-    이 게이트는 "계약이 지목한 Map revision"과 "회전 대상 Map revision"이 어긋나는
-    것을 막으려고 있다. v2는 그 선언을 계약에서 걷어내 **생산자를 pin registry
-    하나로** 만들므로, 막을 모순 자체가 구조적으로 존재하지 않는다.
-
-    검사가 약해지는 것이 아니다 — 격리 preflight가 네 표면의 digest를 릴리스의
-    blob과 대조하고, v1에서는 그 대조가 계약 자신의 revision에 앵커돼 있어
-    service·user는 릴리스와 한 번도 맞춰지지 않았다.
-    """
-
+def _run_rotation_preflight_v2(
+    monkeypatch,
+    capsys,
+    *,
+    contract: bytes,
+    readable: bool = True,
+) -> tuple[int, str, list[str], list[tuple[str, ...]]]:
     driver = _driver()
+    reads, fetches = _rotation_map_blobs(driver, monkeypatch, readable=readable)
 
     def command(*args: str, **kwargs: object) -> str:
         if "show" in args:
-            return _rotation_contract_v2().decode("utf-8")
+            return contract.decode("utf-8")
+        if "fetch" in args:
+            fetches.append(args)
         return ""
 
     monkeypatch.setattr(driver, "_command", command)
+    status = driver.rotation_preflight(_ROTATION_MAP_REVISION, "b" * 40)
+    return status, capsys.readouterr().out, reads, fetches
 
-    assert driver.rotation_preflight("a" * 40, "b" * 40) == 0
-    assert "v2" in capsys.readouterr().out
+
+def test_rotation_preflight_accepts_v2_when_the_digests_match_the_target_map(
+    monkeypatch, capsys
+) -> None:
+    """게이트가 무조건 거부하는 것이 아님을 먼저 건다."""
+
+    status, _out, reads, fetches = _run_rotation_preflight_v2(
+        monkeypatch, capsys, contract=_rotation_contract_v2()
+    )
+
+    assert status == 0
+    # 게이트가 **무엇을** 읽었는지까지 본다. digest 비교만 단언하면 저장소·revision·
+    # 경로를 잘못 지목해도 초록이고, 그러면 회전 대상과의 결박이 사라진다.
+    map_url = PINNED_RUNTIME_RELEASE.source_for("map").canonical_url
+    pinvi_url = PINNED_RUNTIME_RELEASE.source_for("pinvi").canonical_url
+    # 두 fetch가 각각 **자기 저장소의 회전 대상 revision**을 가져온다.
+    assert [args[-2:] for args in fetches] == [
+        (pinvi_url, "b" * 40),
+        (map_url, _ROTATION_MAP_REVISION),
+    ]
+    assert reads and all(
+        target.startswith(_ROTATION_MAP_REVISION + ":") for target in reads
+    )
+    assert {target.partition(":")[2] for target in reads} == {
+        "packages/kor-travel-map-api/openapi.json",
+        "packages/kor-travel-map-api/openapi.service.json",
+        "packages/kor-travel-map-api/openapi.user.json",
+    }
+
+
+def test_rotation_preflight_refuses_v2_whose_surface_digest_differs_from_the_target_map(
+    monkeypatch, capsys
+) -> None:
+    """v2에서 "이 계약은 저 Map을 가리킨다"를 말하는 것은 digest다.
+
+    v1은 그것을 `map.full.source_revision` 문자열로 말했고 이 게이트는 그 문자열을
+    봤다. v2가 그 선언을 걷어낸 뒤 게이트를 무조건 통과로 두면, 계약과 어긋난 Map
+    revision으로의 회전이 **71분짜리 rebuild를 다 태운 뒤에야** 격리 preflight에서
+    거부된다 — 이 게이트가 존재하는 바로 그 실패다(2026-09-02).
+
+    service·user 표면까지 보는 것이 v1보다 오히려 넓다. v1의 digest 대조는 계약
+    자신이 지목한 revision에 앵커돼 있어 "계약은 자기무모순이다"만 증명했다.
+    """
+
+    stale = "9" * 64
+    status, out, _reads, _fetches = _run_rotation_preflight_v2(
+        monkeypatch, capsys, contract=_rotation_contract_v2(user=stale)
+    )
+
+    assert status == 1
+    # 두 값이 **실제로** 보여야 한다. 안 보이면 운영자가 다시 역추적한다.
+    assert stale in out
+    assert _ROTATION_MAP_DIGEST in out
+    assert "user" in out
+
+
+def test_rotation_preflight_refuses_v2_when_the_target_map_surface_is_unreadable(
+    monkeypatch, capsys
+) -> None:
+    """표면을 못 읽으면 통과가 아니라 거부다 — 모르는 것은 괜찮은 것이 아니다."""
+
+    status, out, _reads, _fetches = _run_rotation_preflight_v2(
+        monkeypatch, capsys, contract=_rotation_contract_v2(), readable=False
+    )
+
+    assert status == 1
+    assert "unreadable" in out
+
+
+def test_rotation_preflight_refuses_v2_with_a_non_sha256_surface_digest(
+    monkeypatch, capsys
+) -> None:
+    """digest가 digest가 아니면 대조 자체가 성립하지 않는다.
+
+    길이만 보면 "z"*64 같은 값이 그대로 통과해 **digest 불일치**로 잘못 보고된다.
+    운영자의 다음 행동이 다르므로(계약 오작성 vs 표면 변경) 두 경우를 함께 건다.
+    """
+
+    for broken in ("not-a-digest", "z" * 64):
+        status, out, _reads, _fetches = _run_rotation_preflight_v2(
+            monkeypatch, capsys, contract=_rotation_contract_v2(service=broken)
+        )
+
+        assert status == 1
+        assert "sha256" in out
 
 
 def test_rotation_preflight_refuses_an_unsupported_contract_version(
@@ -3172,7 +3301,18 @@ def _write_v2_pair(pinvi_root: Path, blobs: dict[str, bytes]) -> dict[str, objec
     (pinvi_root / "contracts/kor-travel-map-m05-pair-provenance-v1.json").write_text(
         json.dumps(pair), encoding="utf-8"
     )
+    # service 릴리스 revision의 **정본** 문서. v2에서 pair 계약이 그 사본을 걷어내므로
+    # 하네스는 이 문서에서 값을 읽어야 한다 — pinned Map revision을 넣으면 PinVi가
+    # 부팅 시 거부한다.
+    (pinvi_root / "contracts/kor-travel-map-service-provenance-v1.json").write_text(
+        json.dumps({"map_release_revision": _SERVICE_RELEASE_REVISION}), encoding="utf-8"
+    )
     return pair
+
+
+#: 픽스처의 service 릴리스 revision. pinned Map revision과 **다른** 값이어야 이
+#: 게이트가 무엇을 보는지 분명해진다 — 두 값은 재핀 주기가 달라 실제로 갈라진다.
+_SERVICE_RELEASE_REVISION = "7" * 40
 
 
 def test_pair_v2_anchors_every_surface_to_the_pinned_release(
@@ -3225,11 +3365,58 @@ def test_pair_v2_anchors_every_surface_to_the_pinned_release(
 
     # 네 read 전부가 pinned revision에서 났다 — 이것이 v2의 실질이다.
     assert reads and all(target.startswith(pinned + ":") for target in reads)
-    # fetch도 하나로 줄어든다(계약이 네 revision을 흩뿌리지 않으므로).
-    assert {args[-1] for args in fetches} == {pinned}
+    # fetch는 둘이다: 릴리스 revision과 service 표면의 릴리스 revision. 후자는
+    # 대조에 쓰이지 않고 **PinVi attestation이 읽을 수 있게** 보충하는 것이다
+    # (계약이 네 revision을 흩뿌리던 v1과 달리 흩어지지 않는다).
+    assert {args[-1] for args in fetches} == {pinned, _SERVICE_RELEASE_REVISION}
     assert actual.map_full_openapi_sha256 == pair["map"]["full"]["openapi_sha256"]
     assert service_openapi_sha256 == pair["map"]["service"]["openapi_sha256"]
-    assert service_source_revision == pinned
+    # service 표면의 revision은 pin registry가 정하지 않는다. 그 값의 정본은 PinVi의
+    # service-provenance 계약이고, `config.py`가 컨테이너 부팅 때 이 env를 그 계약과
+    # 대조한다 — pinned를 넣으면 71분 rebuild 뒤 기동 실패다(적대 리뷰 P0).
+    assert service_source_revision == _SERVICE_RELEASE_REVISION
+    assert service_source_revision != pinned
+
+
+@pytest.mark.parametrize("broken", ("z" * 40, "1" * 39, 12345, None))
+def test_pair_v2_rejects_a_malformed_service_release_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken: object
+) -> None:
+    """service 릴리스 revision이 commit이 아니면 env로 흘려보내지 않는다.
+
+    이 값은 PinVi 컨테이너의 env가 되고 PinVi가 부팅 때 자기 계약과 대조한다.
+    형식 검사가 없으면 잘못된 값이 71분 rebuild 뒤에야 드러난다.
+    """
+
+    driver = _driver()
+    pinvi_root = tmp_path / "pinvi"
+    map_root = tmp_path / "map"
+    map_root.mkdir()
+    paths = {
+        "admin": "packages/kor-travel-map-api/openapi.json",
+        "full": "packages/kor-travel-map-api/openapi.json",
+        "service": "packages/kor-travel-map-api/openapi.service.json",
+        "user": "packages/kor-travel-map-api/openapi.user.json",
+    }
+    blobs = {path: json.dumps({"path": path}).encode() for path in set(paths.values())}
+    _write_v2_pair(pinvi_root, blobs)
+    (pinvi_root / "contracts/kor-travel-map-service-provenance-v1.json").write_text(
+        json.dumps({"map_release_revision": broken}), encoding="utf-8"
+    )
+
+    def fake_run(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        _revision, _, path = args[-1].partition(":")
+        return subprocess.CompletedProcess(args, 0, stdout=blobs[path])
+
+    monkeypatch.setattr(driver, "_command", lambda *a, **k: "")
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+
+    with pytest.raises(driver._PhaseError) as error:
+        driver._pair(pinvi_root, map_root)
+
+    assert error.value.diagnostic == "Map service release revision is not a 40-hex commit"
 
 
 def test_pair_v2_rejects_a_declared_source_revision(
