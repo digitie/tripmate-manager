@@ -2367,21 +2367,42 @@ def verify_leaf(leaf: Path) -> int:
         f"result={result.get('manager_source_revision')} installed={trusted_manager}",
     )
 
+    # execution identity는 **history**에서 찾는다. `current`만 보면 이 검증기 자신을
+    # 배포하는 순간(= rebind로 새 identity가 생기는 순간) 그 이전 leaf가 전부
+    # 검증 불가가 된다 — 검증기가 자기가 배포되기 전의 증적을 영원히 못 보는
+    # 구조였다. registry history는 append-only이고 각 binding이 pinset·Map·PinVi
+    # revision을 함께 들고 있으므로, "그 identity가 **지금 고정된 pair**에 결박된
+    # 것이었는가"를 여기서 다시 계산할 수 있다.
+    #
+    # `current` 여부는 통과 조건이 아니라 **보고 대상**이다. Manager 업그레이드는
+    # 정당하게 identity를 바꾸며, 그것이 과거 증적을 무효화하지는 않는다.
+    leaf_identity = payload.get("isolated_execution_identity_sha256")
     try:
         execution = load_runtime_execution_registry()
-        current_identity = execution.current.execution_identity_sha256
+        bindings = (execution.current, *execution.history)
         execution_blocked = execution.is_unconditionally_blocked_current()
+        is_current = execution.current.execution_identity_sha256 == leaf_identity
+        bound = next(
+            (
+                binding
+                for binding in bindings
+                if binding.execution_identity_sha256 == leaf_identity
+                and binding.source_pinset_sha256 == PINNED_RUNTIME_RELEASE.pinset_sha256
+                and binding.map_revision == map_source.revision
+                and binding.pinvi_revision == pinvi_source.revision
+            ),
+            None,
+        )
     except (RuntimeExecutionRegistryError, DeploymentContractError):
-        current_identity = None
+        bound = None
+        is_current = False
         execution_blocked = True
     record(
         "L5 execution identity",
-        current_identity is not None
-        and payload.get("isolated_execution_identity_sha256")
-        == result.get("execution_identity_sha256")
-        == current_identity,
-        f"attestation={payload.get('isolated_execution_identity_sha256')} "
-        f"result={result.get('execution_identity_sha256')} registry={current_identity}",
+        bound is not None
+        and leaf_identity == result.get("execution_identity_sha256"),
+        f"attestation={leaf_identity} result={result.get('execution_identity_sha256')} "
+        f"registry_binding={'found' if bound else 'absent'} is_current={is_current}",
     )
 
     record(
