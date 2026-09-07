@@ -79,6 +79,7 @@ from kor_travel_docker_manager.services.runtime_execution_registry import (
     RuntimeExecutionRegistryError,
     block_current_execution,
     load_runtime_execution_registry,
+    trusted_manager_source_revision,
     write_runtime_execution_registry,
 )
 from kor_travel_docker_manager.services.runtime_pin_registry import (
@@ -2244,6 +2245,182 @@ def rotation_preflight(map_revision: str, pinvi_revision: str) -> int:
     return _rotation_pair_digests(mapping, map_revision=map_revision)
 
 
+
+#: leaf가 스스로 밝히는 하네스 이름. 결과 기록과 검증이 같은 상수를 쓴다 —
+#: 두 곳에 리터럴로 적으면 한쪽만 바뀌어도 검증이 조용히 통과한다.
+_HARNESS_NAME = "m05-isolated-bridge-v1"
+
+#: leaf가 담는 세 증적의 상대 경로. `result.json`의 세 해시가 각각 이것을 가리킨다.
+_LEAF_HASHED_ARTIFACTS = {
+    "m04_attestation_sha256": "runtime/m04/m04-attestation.json",
+    "m05_attestation_sha256": "runtime/m05/attestation.json",
+    "runtime_provenance_sha256": "runtime/isolated-runtime-provenance.json",
+}
+
+
+def _leaf_json(path: Path) -> object:
+    with path.open("rb") as handle:
+        return json.loads(handle.read())
+
+
+def _leaf_object(value: object, *, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} is not an object")
+    return value
+
+
+def verify_leaf(leaf: Path) -> int:
+    """격리 M05 leaf를 **현재 pin registry와 다시 계산해** 대조한다.
+
+    승격(`T-VN-M05-ACTIVATION`)의 근거가 무엇인지를 이 함수가 정의한다.
+
+    **서명은 근거가 아니다.** 드라이버는 실행마다 `openssl genpkey`로 Ed25519 키를
+    새로 만들어 서명하고 실행 종료와 함께 그 키를 지운다 — 공개키가 어디에도 남지
+    않으므로 사후 제3자 검증이 불가능하다. 서명이 봉인하는 것은 생성 시점의 내부
+    정합뿐이다(2026-09-07 적대 리뷰 P1).
+
+    실제 근거는 셋이고 전부 지금 다시 계산할 수 있다:
+
+    1. **root-owned 0600 leaf** — 실행이 남긴 파일 자체.
+    2. **해시 사슬** — `result.json`의 세 해시가 그 파일들의 sha256과 같다.
+    3. **살아 있는 registry와의 일치** — leaf가 주장하는 pinset·Manager revision·
+       execution identity·Map/PinVi revision이 지금 pin registry가 말하는 것과 같고,
+       그 pinset·execution이 terminal로 차단돼 있지 않다.
+
+    하나라도 어긋나면 거부한다. 통과는 "이 leaf가 **현재** 고정된 pair의 증적이다"를
+    뜻하며, pin이 움직이면 같은 leaf가 다시 통과하지 않는다 — 그것이 이 검증이
+    문서 문장과 다른 점이다.
+    """
+
+    checks: list[tuple[str, bool, str]] = []
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        checks.append((name, ok, detail))
+
+    try:
+        result = _leaf_object(_leaf_json(leaf / "result.json"), name="leaf result")
+    except (OSError, TypeError, ValueError):
+        print("leaf result.json is unreadable", flush=True)
+        return 1
+
+    record(
+        "L1 harness/status/phase",
+        result.get("harness") == _HARNESS_NAME
+        and result.get("status") == "passed"
+        and result.get("phase") == "completed",
+        f"harness={result.get('harness')} status={result.get('status')} "
+        f"phase={result.get('phase')}",
+    )
+
+    for field, relative in _LEAF_HASHED_ARTIFACTS.items():
+        path = leaf / relative
+        try:
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            record(f"L2 {relative}", False, "파일을 읽지 못했다")
+            continue
+        record(
+            f"L2 {relative}",
+            actual == result.get(field),
+            f"result.{field}={result.get(field)} recomputed={actual}",
+        )
+
+    try:
+        attestation = _leaf_object(
+            _leaf_json(leaf / _LEAF_HASHED_ARTIFACTS["m05_attestation_sha256"]),
+            name="m05 attestation",
+        )
+        payload = _leaf_object(attestation.get("payload"), name="m05 attestation payload")
+        provenance = _leaf_object(
+            _leaf_json(leaf / _LEAF_HASHED_ARTIFACTS["runtime_provenance_sha256"]),
+            name="isolated runtime provenance",
+        )
+        provenance_map = _leaf_object(provenance.get("map"), name="provenance map")
+    except (OSError, TypeError, ValueError):
+        print("leaf attestation/provenance is unreadable", flush=True)
+        return 1
+
+    map_source = PINNED_RUNTIME_RELEASE.source_for("map")
+    pinvi_source = PINNED_RUNTIME_RELEASE.source_for("pinvi")
+
+    record(
+        "L3 pinset",
+        payload.get("isolated_pinset_sha256")
+        == result.get("pinset_sha256")
+        == PINNED_RUNTIME_RELEASE.pinset_sha256,
+        f"attestation={payload.get('isolated_pinset_sha256')} "
+        f"result={result.get('pinset_sha256')} "
+        f"registry={PINNED_RUNTIME_RELEASE.pinset_sha256}",
+    )
+
+    try:
+        trusted_manager = trusted_manager_source_revision()
+    except (DeploymentContractError, OSError, ValueError):
+        trusted_manager = None
+    record(
+        "L4 Manager source revision",
+        trusted_manager is not None
+        and payload.get("isolated_manager_source_revision")
+        == result.get("manager_source_revision")
+        == trusted_manager,
+        f"attestation={payload.get('isolated_manager_source_revision')} "
+        f"result={result.get('manager_source_revision')} installed={trusted_manager}",
+    )
+
+    try:
+        execution = load_runtime_execution_registry()
+        current_identity = execution.current.execution_identity_sha256
+        execution_blocked = execution.is_unconditionally_blocked_current()
+    except (RuntimeExecutionRegistryError, DeploymentContractError):
+        current_identity = None
+        execution_blocked = True
+    record(
+        "L5 execution identity",
+        current_identity is not None
+        and payload.get("isolated_execution_identity_sha256")
+        == result.get("execution_identity_sha256")
+        == current_identity,
+        f"attestation={payload.get('isolated_execution_identity_sha256')} "
+        f"result={result.get('execution_identity_sha256')} registry={current_identity}",
+    )
+
+    record(
+        "L6 Map/PinVi source revision",
+        provenance_map.get("source_revision") == map_source.revision
+        and provenance.get("pinvi", {}).get("source_revision") == pinvi_source.revision
+        if isinstance(provenance.get("pinvi"), dict)
+        else False,
+        f"provenance map={provenance_map.get('source_revision')} "
+        f"registry map={map_source.revision}",
+    )
+
+    record(
+        "L7 M04 server-side chain",
+        payload.get("m04_server_side_chain_verified") is True,
+        f"m04_server_side_chain_verified={payload.get('m04_server_side_chain_verified')}",
+    )
+
+    try:
+        blocked = load_runtime_pin_registry().is_unconditionally_blocked_pinset(
+            PINNED_RUNTIME_RELEASE.pinset_sha256
+        )
+    except (RuntimePinRegistryError, DeploymentContractError):
+        blocked = True
+    record(
+        "L8 terminal 아님",
+        not blocked and not execution_blocked,
+        f"pinset_blocked={blocked} execution_blocked={execution_blocked}",
+    )
+
+    for name, ok, detail in checks:
+        print(f"{'PASS' if ok else 'FAIL'} {name} — {detail}", flush=True)
+    failed = [name for name, ok, _ in checks if not ok]
+    if failed:
+        print(f"leaf verification FAILED: {', '.join(failed)}", flush=True)
+        return 1
+    print("leaf verification PASSED", flush=True)
+    return 0
+
 def preflight(expected_revision: str) -> int:
     """launcher용 비소비 source-materialization preflight; terminal/ledger를 쓰지 않는다.
 
@@ -3761,7 +3938,7 @@ def main(expected_revision: str, output: Path) -> int:
         for name in _RAW_ENV_NAMES:
             os.environ.pop(name, None)
         result: dict[str, object] = {
-            "harness": "m05-isolated-bridge-v1",
+            "harness": _HARNESS_NAME,
             "manager_source_revision": expected_revision,
             "phase": "completed" if completed else phase,
             "driver_phase": driver_phase,
@@ -3807,6 +3984,8 @@ if __name__ == "__main__":
         raise SystemExit(preflight(sys.argv[2]))
     if len(sys.argv) == 4 and sys.argv[1] == "--rotation-preflight":
         raise SystemExit(rotation_preflight(sys.argv[2], sys.argv[3]))
+    if len(sys.argv) == 3 and sys.argv[1] == "--verify-leaf":
+        raise SystemExit(verify_leaf(Path(sys.argv[2])))
     if len(sys.argv) != 3:
         raise SystemExit(2)
     raise SystemExit(main(sys.argv[1], Path(sys.argv[2])))
