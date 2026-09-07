@@ -1447,7 +1447,8 @@ SELECT string_agg(line, E'
             coalesce(
                 c.relacl,
                 acldefault(
-                    CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END, c.relowner
+                    (CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END)::"char",
+                    c.relowner
                 )
             )::text[],
             ','
@@ -1463,7 +1464,7 @@ SELECT string_agg(line, E'
         pg_catalog.pg_get_function_identity_arguments(p.oid),
         pg_get_userbyid(p.proowner), p.prosecdef,
         array_to_string(
-            coalesce(p.proacl, acldefault('f', p.proowner))::text[], ','
+            coalesce(p.proacl, acldefault('f'::"char", p.proowner))::text[], ','
         )
     )
     FROM pg_catalog.pg_proc AS p
@@ -1473,7 +1474,7 @@ SELECT string_agg(line, E'
     SELECT format('n|%s|%s|%s',
         n.nspname, pg_get_userbyid(n.nspowner),
         array_to_string(
-            coalesce(n.nspacl, acldefault('n', n.nspowner))::text[], ','
+            coalesce(n.nspacl, acldefault('n'::"char", n.nspowner))::text[], ','
         )
     )
     FROM pg_catalog.pg_namespace AS n
