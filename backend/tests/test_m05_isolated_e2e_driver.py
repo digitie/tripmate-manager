@@ -21,6 +21,10 @@ import pytest
 from kor_travel_docker_manager.services.pinned_runtime_release import (
     current_pinned_runtime_release,
 )
+from kor_travel_docker_manager.services.runtime_execution_registry import (
+    BlockedExecution,
+    ExecutionIdentityV6,
+)
 
 PINNED_RUNTIME_RELEASE = current_pinned_runtime_release()
 
@@ -3049,7 +3053,7 @@ def _verify_leaf_fixture(
     attestation_manager: str | None = None,
     m04_attestation_sha: str | None = None,
     ledger_claim: bool = True,
-    blocked_identities: tuple[str, ...] = (),
+    blocked_phases: tuple[str | None, ...] = (),
 ):
     """`--verify-leaf`가 읽는 leaf 한 벌과 그에 맞는 registry 대역을 만든다."""
 
@@ -3059,7 +3063,12 @@ def _verify_leaf_fixture(
     map_revision = pinned.source_for("map").revision
     pinvi_revision = pinned.source_for("pinvi").revision
     manager_revision = "b" * 40
-    identity = "c" * 64
+    # **실제 파생값**을 쓴다 — `BlockedExecution`이 (pinset, manager)에서 identity를
+    # 다시 계산해 대조하므로 임의의 64자 hex로는 registry 타입을 만들 수 없다.
+    identity = ExecutionIdentityV6.build(
+        source_pinset_sha256=pinned.pinset_sha256,
+        manager_source_revision=manager_revision,
+    ).execution_identity_sha256
 
     # leaf는 **검증기를 돌리는 신원 소유의 group/other 닫힌 트리**여야 한다.
     # 종전 픽스처는 이 조건 없이 통과했다 — 그것이 곧 "아무 디렉터리나 통과한다"는
@@ -3155,8 +3164,22 @@ def _verify_leaf_fixture(
             else ()
         )
 
+        # **실제 `BlockedExecution`**을 쓴다. duck-type 스텁은 `phase` 속성이
+        # 없어 scoped 기록을 표현할 수 없고, 그래서 phase 필터를 지우는 변이가
+        # 원리적으로 RED가 되지 않았다(3차 적대 리뷰 P0가 그 구멍으로 들어왔다).
         blocked_executions = tuple(
-            _Binding(value) for value in blocked_identities
+            BlockedExecution(
+                execution_identity_sha256=ExecutionIdentityV6.build(
+                    source_pinset_sha256=pinned.pinset_sha256,
+                    manager_source_revision=manager_revision,
+                ).execution_identity_sha256,
+                source_pinset_sha256=pinned.pinset_sha256,
+                manager_source_revision=manager_revision,
+                reason="integration fixture",
+                blocked_at="2026-09-07T00:00:00Z",
+                phase=phase,
+            )
+            for phase in blocked_phases
         )
 
         @staticmethod
@@ -3886,7 +3909,21 @@ def test_verify_leaf_refuses_a_leaf_outside_the_privileged_trust_boundary(
     # (d) 다른 신원 소유의 디렉터리(테스트는 비-root로 도므로 /etc가 그 예다).
     assert driver.verify_leaf(Path("/etc")) == 1
 
-    # (e) 소유자 대조 자체 — 검증기가 다른 신원으로 돈다고 보면 자기 leaf도 거부한다.
+    # (e) 증적 하위 디렉터리가 열려 있다 — 안쪽 파일은 여전히 0600이다.
+    (leaf / "runtime" / "m05").chmod(0o755)
+    assert driver.verify_leaf(leaf) == 1
+    (leaf / "runtime" / "m05").chmod(0o700)
+    assert driver.verify_leaf(leaf) == 0
+
+    # (f) 증적 파일에 하드링크가 있다 — 같은 inode를 다른 경로에서 계속 바꿀 수 있다.
+    link = tmp_path / "hardlink.json"
+    os.link(leaf / "result.json", link)
+    assert driver.verify_leaf(leaf) == 1
+    link.unlink()
+    assert driver.verify_leaf(leaf) == 0
+    capsys.readouterr()
+
+    # (g) 소유자 대조 자체 — 검증기가 다른 신원으로 돈다고 보면 자기 leaf도 거부한다.
     monkeypatch.setattr(driver.os, "geteuid", lambda: os.getuid() + 1)
     assert driver.verify_leaf(leaf) == 1
     assert "신원의 소유가 아니다" in capsys.readouterr().out
@@ -3991,7 +4028,7 @@ def test_verify_leaf_refuses_a_leaf_whose_own_identity_is_blocked(
 
     driver = _driver()
     leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
-        tmp_path, driver, identity_in_history=True, blocked_identities=("c" * 64,)
+        tmp_path, driver, identity_in_history=True, blocked_phases=(None,)
     )
     monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
@@ -4002,3 +4039,65 @@ def test_verify_leaf_refuses_a_leaf_whose_own_identity_is_blocked(
     out = capsys.readouterr().out
     assert "FAIL L8" in out
     assert "leaf_execution_blocked=True" in out
+
+
+def test_verify_leaf_accepts_a_leaf_whose_identity_has_only_a_phase_scoped_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """phase-scoped 기록은 소각이 아니다 — 그 뒤의 정당한 leaf가 통과해야 한다.
+
+    `blocked_executions`는 무조건 소각과 scoped 기록을 **한 리스트에** 담고, 정본
+    `is_unconditionally_blocked_current()`가 `phase is None`으로 둘을 가른다.
+    execution identity는 (pinset, manager)에서 파생하므로 **Manager를 안 바꾼
+    재시도는 같은 identity**다 — 인프라 phase 실패로 scoped 기록이 남은 뒤 보정해
+    통과한 leaf가 정확히 이 모양이고, 필터가 없으면 그 leaf가 영원히 검증 불가가
+    된다(#330이 넣은 회귀, 3차 적대 리뷰 P0).
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path,
+        driver,
+        identity_in_history=True,
+        blocked_phases=("runtime_setup_ports",),
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 0
+    assert "leaf_execution_blocked=False" in capsys.readouterr().out
+
+
+def test_verify_leaf_does_not_tie_a_past_leaf_to_the_current_identity_burn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """무관한 다음 실행의 소각이 과거 증적을 무효화하지 않는다.
+
+    L4·L5는 "Manager 업그레이드는 과거 증적을 무효화하지 않는다"를 원칙으로 세웠다.
+    L8이 `current`의 소각을 보면 그 원칙이 L8에서만 깨진다 — 승격 근거가 관계없는
+    실패 한 건으로 사라진다(3차 적대 리뷰 P1).
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+
+    class _BurnedCurrent:
+        current = registry.current
+        history = registry.history
+        blocked_executions = registry.blocked_executions
+
+        @staticmethod
+        def is_unconditionally_blocked_current() -> bool:
+            return True
+
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: _BurnedCurrent)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 0
+    assert "leaf_execution_blocked=False" in capsys.readouterr().out
