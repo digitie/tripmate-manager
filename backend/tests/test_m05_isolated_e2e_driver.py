@@ -47,94 +47,6 @@ def _pair_entry(*, revision: str, raw: bytes) -> dict[str, str]:
     }
 
 
-def test_pair_reads_every_pinned_openapi_blob_before_accepting_pair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    driver = _driver()
-    pinvi_root = tmp_path / "pinvi"
-    map_root = tmp_path / "map"
-    (pinvi_root / "contracts").mkdir(parents=True)
-    map_root.mkdir()
-    map_revision = PINNED_RUNTIME_RELEASE.source_for("map").revision
-    revisions = {
-        "admin": map_revision,
-        "full": map_revision,
-        "service": "c" * 40,
-        "user": "d" * 40,
-    }
-    paths = {
-        "admin": "packages/kor-travel-map-api/openapi.json",
-        "full": "packages/kor-travel-map-api/openapi.json",
-        "service": "packages/kor-travel-map-api/openapi.service.json",
-        "user": "packages/kor-travel-map-api/openapi.user.json",
-    }
-    blobs = {
-        f"{revisions[name]}:{paths[name]}": json.dumps({"name": name}).encode() for name in paths
-    }
-    pair = {
-        "map": {
-            name: _pair_entry(
-                revision=revisions[name], raw=blobs[f"{revisions[name]}:{paths[name]}"]
-            )
-            for name in paths
-        },
-        "runtime_image_digests": {},
-        "version": 1,
-    }
-    (pinvi_root / "contracts/kor-travel-map-m05-pair-provenance-v1.json").write_text(
-        json.dumps(pair), encoding="utf-8"
-    )
-    fetches: list[tuple[str, ...]] = []
-
-    def fake_command(*args: str, **_kwargs: object) -> str:
-        fetches.append(args)
-        return ""
-
-    def fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        target = args[-1]
-        return subprocess.CompletedProcess(args, 0, stdout=blobs[target])
-
-    monkeypatch.setattr(driver, "_command", fake_command)
-    monkeypatch.setattr(driver.subprocess, "run", fake_run)
-    actual, service_openapi_sha256, service_source_revision = driver._pair(pinvi_root, map_root)
-
-    assert actual.map_full_openapi_sha256 == pair["map"]["full"]["openapi_sha256"]
-    assert service_openapi_sha256 == pair["map"]["service"]["openapi_sha256"]
-    assert service_source_revision == revisions["service"]
-    assert {args[-1] for args in fetches} == set(revisions.values())
-
-
-def test_pair_rejects_a_historical_blob_digest_mismatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    driver = _driver()
-    pinvi_root = tmp_path / "pinvi"
-    map_root = tmp_path / "map"
-    (pinvi_root / "contracts").mkdir(parents=True)
-    map_root.mkdir()
-    revision = PINNED_RUNTIME_RELEASE.source_for("map").revision
-    raw = b'{"version":1}'
-    entry = _pair_entry(revision=revision, raw=raw)
-    pair = {
-        "map": {name: dict(entry) for name in ("admin", "full", "service", "user")},
-        "runtime_image_digests": {},
-        "version": 1,
-    }
-    pair["map"]["service"]["openapi_sha256"] = "0" * 64
-    (pinvi_root / "contracts/kor-travel-map-m05-pair-provenance-v1.json").write_text(
-        json.dumps(pair), encoding="utf-8"
-    )
-    monkeypatch.setattr(driver, "_command", lambda *_args, **_kwargs: "")
-    monkeypatch.setattr(
-        driver.subprocess,
-        "run",
-        lambda args, **_kwargs: subprocess.CompletedProcess(args, 0, stdout=raw),
-    )
-
-    with pytest.raises(driver._PhaseError, match="pair_contract_invalid"):
-        driver._pair(pinvi_root, map_root)
-
-
 def test_pinvi_manager_admission_contract_requires_the_gate_and_verifier(tmp_path: Path) -> None:
     driver = _driver()
     scripts = tmp_path / "scripts"
@@ -2943,69 +2855,6 @@ def _run_rotation_preflight(
     return status, capsys.readouterr().out
 
 
-def test_rotation_preflight_accepts_a_pair_that_targets_the_requested_map(
-    monkeypatch, capsys
-) -> None:
-    """일치하면 통과한다 — 게이트가 무조건 거부하는 것이 아님을 먼저 건다."""
-
-    map_revision = "a" * 40
-    status, _out = _run_rotation_preflight(
-        monkeypatch,
-        map_revision=map_revision,
-        pinvi_revision="b" * 40,
-        contract=_rotation_contract(admin=map_revision, full=map_revision),
-        capsys=capsys,
-    )
-
-    assert status == 0
-
-
-def test_rotation_preflight_refuses_a_contract_for_another_map_revision(
-    monkeypatch, capsys
-) -> None:
-    """이 거부가 없으면 71분짜리 rebuild를 태운 뒤에야 같은 모순이 드러난다.
-
-    2026-09-02에 실제로 그렇게 잃었다 — 계약은 Map `4f268633`을 지목하는데
-    pinset은 `f58de9f4`를 핀했고, rebuild가 끝난 뒤 격리 preflight가 몇 초 만에
-    거부했다. `run-pinned-rebuild-once`는 이 계약을 읽지 않는다.
-    """
-
-    contract_revision = "c" * 40
-    requested = "d" * 40
-    status, out = _run_rotation_preflight(
-        monkeypatch,
-        map_revision=requested,
-        pinvi_revision="b" * 40,
-        contract=_rotation_contract(
-            admin=contract_revision, full=contract_revision
-        ),
-        capsys=capsys,
-    )
-
-    assert status == 1
-    # 두 값이 **실제로** 보여야 한다. 안 보이면 운영자가 다시 역추적한다.
-    assert contract_revision in out
-    assert requested in out
-
-
-def test_rotation_preflight_refuses_a_contract_whose_admin_and_full_disagree(
-    monkeypatch, capsys
-) -> None:
-    """admin/full이 갈라진 pair는 body 진입 후 무조건 소각으로만 드러난다."""
-
-    full = "e" * 40
-    status, out = _run_rotation_preflight(
-        monkeypatch,
-        map_revision=full,
-        pinvi_revision="b" * 40,
-        contract=_rotation_contract(admin="f" * 40, full=full),
-        capsys=capsys,
-    )
-
-    assert status == 1
-    assert "admin" in out and "full" in out
-
-
 def _run_rotation_preflight_v2(
     monkeypatch,
     capsys,
@@ -3114,6 +2963,28 @@ def test_rotation_preflight_refuses_v2_with_a_non_sha256_surface_digest(
         assert "sha256" in out
 
 
+def test_rotation_preflight_refuses_a_v1_contract_after_the_transition(
+    monkeypatch, capsys
+) -> None:
+    """v1 계약은 이제 거부된다 — 그리고 **어느 판인지 말한다.**
+
+    §6이 green이 된 뒤 dual-read를 걷었다(`T-VN-PAIR-V2` §7). v1 pinset으로 재개해야
+    하는 상황이 오면 그 사실이 메시지에서 바로 보여야 한다. 조용히 다른 이유로
+    죽으면 운영자가 revert가 답이라는 것을 알 수 없다.
+    """
+
+    status, out = _run_rotation_preflight(
+        monkeypatch,
+        map_revision="a" * 40,
+        pinvi_revision="b" * 40,
+        contract=_rotation_contract(admin="a" * 40, full="a" * 40, version=1),
+        capsys=capsys,
+    )
+
+    assert status == 1
+    assert "version is unsupported: 1" in out
+
+
 def test_rotation_preflight_refuses_an_unsupported_contract_version(
     monkeypatch, capsys
 ) -> None:
@@ -3196,6 +3067,15 @@ def test_pair_failures_carry_a_closed_vocabulary_diagnostic() -> None:
     assert used, "진단 문자열을 하나도 찾지 못했다 — 이 검사가 공허해졌다"
     assert used <= driver._PAIR_DIAGNOSTICS
 
+    # 어휘가 **한 방향으로만** 검사되면 죽은 항목이 쌓인다. v1 분기를 걷은 뒤
+    # 실제로 넷이 죽어 있었다(`T-VN-PAIR-V2` §7). allowlist의 모든 항목이 이
+    # 파일 어딘가에서 실제로 발신되는지도 함께 본다.
+    start = source.index("_PAIR_DIAGNOSTICS")
+    end = source.index("\n)\n", start) + 3
+    body = source[:start] + source[end:]
+    dead = {value for value in driver._PAIR_DIAGNOSTICS if f'"{value}"' not in body}
+    assert not dead, f"발신되지 않는 진단 어휘가 남아 있다: {sorted(dead)}"
+
 
 def test_preflight_reports_only_allowlisted_diagnostics(monkeypatch, capsys) -> None:
     """진단은 내되 allowlist 밖 문자열은 phase만 낸다.
@@ -3210,7 +3090,7 @@ def test_preflight_reports_only_allowlisted_diagnostics(monkeypatch, capsys) -> 
     def allowed() -> None:
         driver._fail(
             "pair_contract_invalid",
-            diagnostic="pair full source revision differs from the pinned release",
+            diagnostic="pair source blob digest differs from the pinned release",
         )
 
     def leaky() -> None:
@@ -3223,7 +3103,7 @@ def test_preflight_reports_only_allowlisted_diagnostics(monkeypatch, capsys) -> 
 
     monkeypatch.setattr(driver, "_source_pair_preflight", allowed)
     assert driver.preflight("a" * 40) == 1
-    assert "pair full source revision differs" in capsys.readouterr().out
+    assert "pair source blob digest differs" in capsys.readouterr().out
 
     monkeypatch.setattr(driver, "_source_pair_preflight", leaky)
     assert driver.preflight("a" * 40) == 1
@@ -3448,7 +3328,43 @@ def test_pair_v2_rejects_a_declared_source_revision(
         driver._pair(pinvi_root, map_root)
 
     assert raised.value.phase == "pair_contract_invalid"
-    assert raised.value.diagnostic in driver._PAIR_DIAGNOSTICS
+    # 잡는 것은 entry 스키마 검사다 — 전용 검사를 따로 두면 도달하지 못한다.
+    assert raised.value.diagnostic == "pair entry schema is invalid"
+
+
+def test_pair_rejects_a_v1_contract_after_the_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v1 계약은 이제 거부된다(`T-VN-PAIR-V2` §7).
+
+    §6이 green이 된 뒤 dual-read를 걷었다. v1 pinset으로 재개해야 하면 그 커밋을
+    revert하는 것이 답이고, 그 판단을 하려면 **거부가 버전 때문임이** 보여야 한다.
+    """
+
+    driver = _driver()
+    pinvi_root = tmp_path / "pinvi"
+    map_root = tmp_path / "map"
+    map_root.mkdir()
+    revision = PINNED_RUNTIME_RELEASE.source_for("map").revision
+    raw = b'{"version":1}'
+    pair = {
+        "map": {
+            name: _pair_entry(revision=revision, raw=raw)
+            for name in ("admin", "full", "service", "user")
+        },
+        "runtime_image_digests": {},
+        "version": 1,
+    }
+    (pinvi_root / "contracts").mkdir(parents=True)
+    (pinvi_root / "contracts/kor-travel-map-m05-pair-provenance-v1.json").write_text(
+        json.dumps(pair), encoding="utf-8"
+    )
+    monkeypatch.setattr(driver, "_command", lambda *_a, **_k: "")
+
+    with pytest.raises(driver._PhaseError) as raised:
+        driver._pair(pinvi_root, map_root)
+
+    assert raised.value.diagnostic == "pair contract version is unsupported"
 
 
 def test_pair_rejects_an_unsupported_contract_version(

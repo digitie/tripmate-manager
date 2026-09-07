@@ -1765,16 +1765,11 @@ _PAIR_DIAGNOSTICS: frozenset[str] = frozenset(
         "pair contract envelope schema is invalid",
         "pair entry schema is invalid",
         "pair digest field is not sha256",
-        "pair source revision is not a 40-hex commit",
-        "pair full source revision differs from the pinned release",
-        "pair admin source revision differs from full",
         "pair source blob is unreadable at the contract revision",
-        "pair source blob digest differs from the contract",
         "pair source blob is not canonical json",
         "pair source canonical digest differs from the contract",
         "pair service entry is invalid",
         "pair contract version is unsupported",
-        "pair contract v2 must not declare a source revision",
         "pair source blob digest differs from the pinned release",
         "Map service provenance contract is unreadable",
         "Map service release revision is not a 40-hex commit",
@@ -1859,30 +1854,29 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         "source_operation_contract_sha256",
         "source_revision",
     }
-    # v1과 v2를 모두 읽는다(dual-read). 두 저장소를 동시에 바꿀 수 없으므로
-    # Manager가 먼저 양쪽을 수용하고, PinVi가 v2로 올라간 뒤 회전·격리 e2e가
-    # green이면 그때 v1 분기를 뗀다. 이 단계를 v2-only로 하면 현재 pinset으로의
-    # 재개 경로가 즉시 막힌다.
+    # **v2만 읽는다.** dual-read는 두 저장소를 동시에 바꿀 수 없어서 둔 이행
+    # 장치였고 그 이행이 끝났다 — 2026-09-07 pinset `b229446a`에서 회전 → rebuild
+    # → 격리 M05 e2e가 `status: passed`로 닫혔다(`T-VN-PAIR-V2` §6; 정본 문서는
+    # Map 저장소 `docs/tasks-acceptance.md`의 같은 이름 절이다). 판을 둘 유지하는
+    # 것 자체가 "어느 판을 받는가"의 두 번째 선언이라 여기서 걷는다.
     #
-    # v2의 요지: `source_revision`을 계약에서 걷어낸다. 그 값의 생산자는 pin
-    # registry 하나여야 하는데 계약이 두 번째로 선언하고 있었고, 그 때문에 Map
-    # 문서 한 줄이 PinVi 커밋 → 새 pinset → 71분 rebuild를 불렀다(2026-09-01
-    # 이후 네 번, 그중 하나는 커밋 제목이 스스로 docs-only bump라고 적었다).
+    # v2의 요지: `source_revision`과 `runtime_image_digests`를 계약에서 걷어낸다.
+    # 두 값의 생산자는 pin registry 하나여야 하는데 계약이 두 번째로 선언하고
+    # 있었고, 그 때문에 Map 문서 한 줄이 PinVi 커밋 → 새 pinset → 71분 rebuild를
+    # 불렀다(2026-09-01 이후 12건, 그중 10건은 상류 OpenAPI가 바이트 동일).
+    #
+    # v1 pinset으로 재개해야 하면 이 커밋을 revert한다 — 그것이 되돌리는 방법이다.
     version = value.get("version") if isinstance(value, dict) else None
-    if version not in (1, 2):
+    if version != 2:
         _fail(
             "pair_contract_invalid",
             diagnostic="pair contract version is unsupported",
         )
-    if version == 1:
-        expected_envelope = {"map", "runtime_image_digests", "version"}
-        entry_keys = expected_entry_keys
-    else:
-        # v2는 digest만 담는다. `runtime_image_digests`도 없다 — 격리 경로는
-        # 이미 Manager receipt의 실측 image ID로 전량 대체하고 있었고, 그 값은
-        # 두 pinset 낡은 채 방치돼 있었다.
-        expected_envelope = {"map", "version"}
-        entry_keys = expected_entry_keys - {"source_revision"}
+    # v2는 digest만 담는다. `runtime_image_digests`도 없다 — 격리 경로는 이미
+    # Manager receipt의 실측 image ID로 전량 대체하고 있었고, 그 값은 두 pinset
+    # 낡은 채 방치돼 있었다.
+    expected_envelope = {"map", "version"}
+    entry_keys = expected_entry_keys - {"source_revision"}
     if (
         not isinstance(value, dict)
         or set(value) != expected_envelope
@@ -1905,52 +1899,23 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         _sha256_text(entry.get("runtime_operation_contract_sha256"))
         _sha256_text(entry.get("source_canonical_sha256"))
         _sha256_text(entry.get("source_operation_contract_sha256"))
-        if version == 1:
-            entry_revision = entry.get("source_revision")
-            if (
-                not isinstance(entry_revision, str)
-                or len(entry_revision) != _REVISION_LENGTH
-                or any(char not in "0123456789abcdef" for char in entry_revision)
-            ):
-                _fail(
-                    "pair_contract_invalid",
-                    diagnostic="pair source revision is not a 40-hex commit",
-                )
-            revisions.add(entry_revision)
-        elif "source_revision" in entry:
-            _fail(
-                "pair_contract_invalid",
-                diagnostic="pair contract v2 must not declare a source revision",
-            )
-    if version == 2:
-        # v2의 앵커는 pinned revision 하나다. 이것이 이 전환의 실질이다 —
-        # v1에서 digest 대조는 **계약이 스스로 지목한 revision**에 앵커돼 있어
-        # "계약은 자기무모순이다"만 증명했다. v2에서는 네 entry 전부가 릴리스의
-        # blob과 대조되므로, service·user 표면이 **처음으로** 릴리스에 결박된다.
-        revisions.add(pinned_map_revision)
-        # PinVi attestation은 service 표면을 **그 표면의 릴리스 revision**에서
-        # 읽는다(`_surface_revisions`). 그 object가 checkout에 없으면 하네스가
-        # 다 돌고 난 뒤 `git show`에서 죽는다 — 여기서 함께 보충한다.
-        revisions.add(_service_release_revision(pinvi_root))
+        # `source_revision` 재선언은 위 `set(entry) != entry_keys`가 이미 잡는다 —
+        # entry_keys가 그 키를 빼고 만들어지기 때문이다. 종전에는 여기에 전용
+        # 검사가 하나 더 있었지만 **도달할 수 없었다**(변이 검증에서 드러났다).
+    # 앵커는 pinned revision 하나다. 이것이 이 전환의 실질이다 — v1에서 digest
+    # 대조는 **계약이 스스로 지목한 revision**에 앵커돼 있어 "계약은
+    # 자기무모순이다"만 증명했다. 이제 네 entry 전부가 릴리스의 blob과 대조되므로
+    # service·user 표면이 릴리스에 결박된다.
+    revisions.add(pinned_map_revision)
+    # PinVi attestation은 service 표면을 **그 표면의 릴리스 revision**에서
+    # 읽는다(`_surface_revisions`). 그 object가 checkout에 없으면 하네스가 다 돌고
+    # 난 뒤 `git show`에서 죽는다 — 여기서 함께 보충한다.
+    revisions.add(_service_release_revision(pinvi_root))
     map_hash = _sha256_text(full.get("openapi_sha256"))
-    if version == 1:
-        # v1에서만 필요한 두 검사다. 계약이 자기 revision을 선언하므로 그것이
-        # 릴리스와 같은지, 그리고 admin/full이 서로 같은지를 봐야 한다.
-        # v2에는 선언 자체가 없어 이 모순이 **구조적으로 존재할 수 없다.**
-        if full.get("source_revision") != pinned_map_revision:
-            _fail(
-                "pair_contract_invalid",
-                diagnostic="pair full source revision differs from the pinned release",
-            )
-        # harness는 runtime 컨테이너의 OCI revision 라벨을 full 기준으로 결박하고,
-        # PinVi attestation은 같은 컨테이너를 admin 기준으로 대조한다. 두 엔트리가
-        # 갈라진 pair를 여기서(실행권 소비 전, scoped) 닫지 않으면 그 모순은 body
-        # 진입 후 무조건 소각으로만 드러난다(적대 리뷰 정찰).
-        if mapping["admin"].get("source_revision") != full.get("source_revision"):
-            _fail(
-                "pair_contract_invalid",
-                diagnostic="pair admin source revision differs from full",
-            )
+    # v1에는 여기 두 검사가 더 있었다 — 계약이 선언한 revision이 릴리스와 같은지,
+    # 그리고 admin/full이 서로 같은지. v2에는 그 선언 자체가 없어 두 모순이
+    # **구조적으로 존재할 수 없다.** 없앤 것은 검사가 아니라 검사가 필요했던
+    # 이유다(위 entry 루프가 `source_revision` 재선언을 거부한다).
     # M05 source attestation은 pair가 지정한 admin/full/service/user Git blob 모두를
     # exact revision으로 다시 읽는다. materializer가 현재 head만 fetch하므로 worktree는
     # 바꾸지 않고 canonical bare source에 이 네 object만 보충한다.
@@ -1969,15 +1934,7 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         entry = mapping[name]
         if not isinstance(entry, dict):
             _fail("pair_contract_invalid", diagnostic="pair entry schema is invalid")
-        if version == 1:
-            revision = entry.get("source_revision")
-            if not isinstance(revision, str):
-                _fail(
-                    "pair_contract_invalid",
-                    diagnostic="pair source revision is not a 40-hex commit",
-                )
-        else:
-            revision = pinned_map_revision
+        revision = pinned_map_revision
         try:
             raw = subprocess.run(
                 [
@@ -2002,16 +1959,12 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
         if raw.returncode != 0 or hashlib.sha256(
             raw.stdout
         ).hexdigest() != _sha256_text(entry["openapi_sha256"]):
-            # 같은 문자열이 두 사실을 뜻하게 두지 않는다. v1은 "계약이 자기
-            # revision과 어긋난다"이고, v2는 "계약이 **릴리스**와 어긋난다"다 —
-            # 후자는 진짜 표면 변경이므로 운영자의 다음 행동이 다르다.
+            # 계약이 **릴리스**와 어긋난다 — 진짜 표면 변경이므로 운영자의
+            # 다음 행동은 재벤더링이다. v1에는 "계약이 자기 revision과 어긋난다"는
+            # 다른 사실도 있었으나 그 선언이 사라져 이 자리에 한 뜻만 남는다.
             _fail(
                 "pair_contract_invalid",
-                diagnostic=(
-                    "pair source blob digest differs from the contract"
-                    if version == 1
-                    else "pair source blob digest differs from the pinned release"
-                ),
+                diagnostic="pair source blob digest differs from the pinned release",
             )
         try:
             source_value = json.loads(raw.stdout)
@@ -2031,18 +1984,13 @@ def _pair(pinvi_root: Path, map_root: Path) -> tuple[M05IsolatedPairEvidence, st
     if not isinstance(service, dict):
         _fail("pair_contract_invalid", diagnostic="pair service entry is invalid")
     service_openapi_sha256 = _sha256_text(service.get("openapi_sha256"))
-    if version == 1:
-        service_source_revision = service.get("source_revision")
-        if not isinstance(service_source_revision, str):
-            _fail("pair_contract_invalid", diagnostic="pair service entry is invalid")
-    else:
-        # v2에서 service 표면의 revision을 정하는 것은 pin registry가 **아니다.**
-        # 그 값의 정본은 PinVi의 `kor-travel-map-service-provenance-v1.json`이고,
-        # v1 pair 계약이 그것을 세 번째로 선언하고 있었을 뿐이다. 여기에 pinned
-        # Map revision을 넣으면 PinVi가 부팅 시 거부한다 — `config.py`의
-        # `validate_feature_reference_reconciliation`이 이 값을 그 계약과 대조하고,
-        # 두 값은 재핀 주기가 달라 실제로 갈라져 있다(적대 리뷰 P0).
-        service_source_revision = _service_release_revision(pinvi_root)
+    # service 표면의 revision을 정하는 것은 pin registry가 **아니다.** 그 값의
+    # 정본은 PinVi의 `kor-travel-map-service-provenance-v1.json`이고, v1 pair
+    # 계약이 그것을 세 번째로 선언하고 있었을 뿐이다. 여기에 pinned Map revision을
+    # 넣으면 PinVi가 부팅 시 거부한다 — `config.py`의
+    # `validate_feature_reference_reconciliation`이 이 값을 그 계약과 대조하고,
+    # 두 값은 재핀 주기가 달라 실제로 갈라져 있다(적대 리뷰 P0).
+    service_source_revision = _service_release_revision(pinvi_root)
     return (
         M05IsolatedPairEvidence(
             map_full_openapi_sha256=map_hash,
@@ -2284,40 +2232,16 @@ def rotation_preflight(map_revision: str, pinvi_revision: str) -> int:
     except (KeyError, TypeError, json.JSONDecodeError):
         print("rotation pair contract schema is invalid", flush=True)
         return 1
-    if version == 2:
-        # v2 계약에는 비교할 revision 문자열이 없다. 그렇다고 볼 것이 없어지는
-        # 것은 아니다 — v1에서 revision이 하던 역할("이 계약은 저 Map을
-        # 가리킨다")을 v2에서는 **digest가** 한다. 그 대조는 격리 e2e의
-        # `_pair`에도 있지만 그것은 회전·rebuild가 끝난 **뒤**다. 여기서 같은
-        # 대조를 회전 대상 revision에 대해 앞으로 당기지 않으면, v2가 이 게이트가
-        # 막던 71분 소각을 그대로 되살린다(2026-09-02에 실제로 잃은 그 사이클).
-        return _rotation_pair_digests(mapping, map_revision=map_revision)
-    if version != 1:
+    if version != 2:
         print(f"rotation pair contract version is unsupported: {version}", flush=True)
         return 1
-    try:
-        full_revision = mapping["full"]["source_revision"]
-        admin_revision = mapping["admin"]["source_revision"]
-    except (KeyError, TypeError):
-        print("rotation pair contract schema is invalid", flush=True)
-        return 1
-    if admin_revision != full_revision:
-        # 두 값 모두 공개 커밋 SHA다 — 비밀이 아니다. 이 자리에서 실제 값을
-        # 보여 주지 않으면 운영자가 다시 traceback으로 역추적해야 한다.
-        print(
-            "rotation pair contract admin/full disagree: "
-            f"admin={admin_revision} full={full_revision}",
-            flush=True,
-        )
-        return 1
-    if full_revision != map_revision:
-        print(
-            "rotation pair contract targets a different Map revision: "
-            f"contract={full_revision} requested={map_revision}",
-            flush=True,
-        )
-        return 1
-    return 0
+    # 계약에는 비교할 revision 문자열이 없다. 그렇다고 볼 것이 없어지는 것은
+    # 아니다 — v1에서 revision이 하던 역할("이 계약은 저 Map을 가리킨다")을
+    # 이제 **digest가** 한다. 그 대조는 격리 e2e의 `_pair`에도 있지만 그것은
+    # 회전·rebuild가 끝난 **뒤**다. 여기서 같은 대조를 회전 대상 revision에 대해
+    # 앞으로 당기지 않으면 이 게이트가 막던 71분 소각이 되살아난다(2026-09-02에
+    # 실제로 잃은 그 사이클).
+    return _rotation_pair_digests(mapping, map_revision=map_revision)
 
 
 def preflight(expected_revision: str) -> int:
