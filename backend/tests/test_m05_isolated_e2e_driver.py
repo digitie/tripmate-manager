@@ -3047,6 +3047,9 @@ def _verify_leaf_fixture(
     binding_manager: str | None = None,
     result_manager: str | None = None,
     attestation_manager: str | None = None,
+    m04_attestation_sha: str | None = None,
+    ledger_claim: bool = True,
+    blocked_identities: tuple[str, ...] = (),
 ):
     """`--verify-leaf`가 읽는 leaf 한 벌과 그에 맞는 registry 대역을 만든다."""
 
@@ -3058,9 +3061,14 @@ def _verify_leaf_fixture(
     manager_revision = "b" * 40
     identity = "c" * 64
 
+    # leaf는 **검증기를 돌리는 신원 소유의 group/other 닫힌 트리**여야 한다.
+    # 종전 픽스처는 이 조건 없이 통과했다 — 그것이 곧 "아무 디렉터리나 통과한다"는
+    # 결함의 증거였다(2026-09-07 적대 리뷰 P0).
     leaf = tmp_path / "leaf"
     (leaf / "runtime" / "m04").mkdir(parents=True)
     (leaf / "runtime" / "m05").mkdir(parents=True)
+    for directory in (leaf, leaf / "runtime", leaf / "runtime/m04", leaf / "runtime/m05"):
+        directory.chmod(0o700)
 
     provenance = {
         "kind": "m05-isolated-runtime-provenance-v1",
@@ -3073,6 +3081,8 @@ def _verify_leaf_fixture(
             "isolated_manager_source_revision": attestation_manager or manager_revision,
             "isolated_execution_identity_sha256": identity,
             "m04_server_side_chain_verified": True,
+            # M04 증적을 사슬에 넣는 결박. 아래에서 실제 해시로 덮어쓴다.
+            "m04_attestation_sha256": None,
         },
         "signature": "unused",
     }
@@ -3081,11 +3091,15 @@ def _verify_leaf_fixture(
     def write(path, value):
         raw = json.dumps(value).encode()
         path.write_bytes(raw)
+        path.chmod(0o600)
         return _hashlib.sha256(raw).hexdigest()
 
     provenance_sha = write(leaf / "runtime/isolated-runtime-provenance.json", provenance)
-    attestation_sha = write(leaf / "runtime/m05/attestation.json", attestation)
     m04_sha = write(leaf / "runtime/m04/m04-attestation.json", m04)
+    attestation["payload"]["m04_attestation_sha256"] = (
+        m04_attestation_sha or m04_sha
+    )
+    attestation_sha = write(leaf / "runtime/m05/attestation.json", attestation)
     (leaf / "result.json").write_bytes(
         json.dumps(
             {
@@ -3098,9 +3112,25 @@ def _verify_leaf_fixture(
                 "m04_attestation_sha256": m04_sha,
                 "m05_attestation_sha256": attestation_sha,
                 "runtime_provenance_sha256": provenance_sha,
+                "source_pinset_sha256": pinned.pinset_sha256,
             }
         ).encode()
     )
+    (leaf / "result.json").chmod(0o600)
+
+    # **root-only ledger claim.** 이것이 없으면 공개값만으로 조립한 leaf와 실제 실행이
+    # 만든 leaf를 구별할 수 없다. 픽스처가 claim을 직접 계산해 만들어야 이 축이
+    # 실제로 재어진다 — 검증기와 planner가 같은 payload 모양을 쓰는지도 함께 걸린다.
+    ledger = tmp_path / "ledger"
+    ledger.mkdir(mode=0o700)
+    if ledger_claim is not False:
+        claim = driver._leaf_ledger_claim_name(
+            manager_source_revision=result_manager or manager_revision,
+            execution_identity_sha256=result_identity or identity,
+            pinset_sha256=pinned.pinset_sha256,
+        )
+        (ledger / claim).write_bytes(b"claim\n")
+        (ledger / claim).chmod(0o600)
 
     class _Binding:
         def __init__(
@@ -3126,6 +3156,10 @@ def _verify_leaf_fixture(
             else ()
         )
 
+        blocked_executions = tuple(
+            _Binding(value) for value in blocked_identities
+        )
+
         @staticmethod
         def is_unconditionally_blocked_current() -> bool:
             return False
@@ -3135,7 +3169,7 @@ def _verify_leaf_fixture(
         def is_unconditionally_blocked_pinset(_sha: str) -> bool:
             return False
 
-    return leaf, manager_revision, _Registry, _Pins
+    return leaf, manager_revision, _Registry, _Pins, ledger
 
 
 def test_verify_leaf_accepts_an_identity_that_is_only_in_registry_history(
@@ -3150,9 +3184,10 @@ def test_verify_leaf_accepts_an_identity_that_is_only_in_registry_history(
     pair**에 결박된 것이었는가"를 다시 계산할 수 있다.
     """
     driver = _driver()
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=True
     )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
@@ -3169,9 +3204,10 @@ def test_verify_leaf_refuses_an_identity_bound_to_no_pinned_pair(
 ) -> None:
     """history에도 없는 identity는 거부한다 — 넓힌 것은 '어디서 찾는가'이지 결박이 아니다."""
     driver = _driver()
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=False
     )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
@@ -3191,10 +3227,11 @@ def test_verify_leaf_accepts_a_leaf_built_by_an_older_manager_release(
     들고 있었다). 정본은 그 leaf가 결박된 **registry binding**이다.
     """
     driver = _driver()
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=True
     )
     # 설치된 Manager는 leaf가 만들어진 뒤 업그레이드됐다.
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: "9" * 40)
@@ -3217,9 +3254,10 @@ def test_verify_leaf_refuses_attestation_and_result_manager_drift(
     # result·binding은 서로 맞고 **attestation만** 어긋나게 둔다. 그래야 이 게이트가
     # "attestation도 본다"는 사실 하나만 겨냥한다 — result만 어긋내면 binding 대조가
     # 대신 잡아서 게이트가 공허해진다(변이 검증에서 실제로 그랬다).
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=True, attestation_manager="7" * 40
     )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
@@ -3233,9 +3271,10 @@ def test_verify_leaf_refuses_manager_revision_that_the_binding_denies(
 ) -> None:
     """leaf가 주장하는 Manager revision이 그 binding의 것과 다르면 거부한다."""
     driver = _driver()
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=True, binding_manager="a" * 40
     )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
@@ -3253,9 +3292,10 @@ def test_verify_leaf_refuses_history_bound_to_another_pinset(
     받아 주면 "이 leaf가 현재 고정된 pair의 증적이다"라는 통과의 뜻이 사라진다.
     """
     driver = _driver()
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=True, history_pinset="e" * 64
     )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
@@ -3272,9 +3312,10 @@ def test_verify_leaf_refuses_attestation_and_result_identity_drift(
     leaf 안에서 두 문서가 갈라지는 것은 그 자체로 증적이 아니다.
     """
     driver = _driver()
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=True, result_identity="f" * 64
     )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
@@ -3288,9 +3329,10 @@ def test_verify_leaf_recomputes_the_hash_chain(
 ) -> None:
     """`result.json`의 해시는 **다시 계산해서** 대조한다 — 적힌 값을 믿지 않는다."""
     driver = _driver()
-    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
         tmp_path, driver, identity_in_history=True
     )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
     monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
     monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
     monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
@@ -3803,3 +3845,161 @@ def test_main_reports_the_receipt_write_failure_through_that_rule(
     assert driver.main("a" * 40, tmp_path) == 1
     assert seen == [{"completed": False, "receipt_write_failed": True}]
     assert not (tmp_path / "result.json").exists()
+
+
+def test_verify_leaf_refuses_a_leaf_outside_the_privileged_trust_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """leaf가 특권 신원의 산물이라는 증거가 없으면 거부한다.
+
+    종전 검증기는 leaf의 소유자·권한·symlink를 **한 번도 보지 않았다** — 그래서
+    `--verify-leaf`가 사실상 아무 디렉터리나 받았고, 정의가 내건 근거 셋 중 첫째
+    ("root-owned 0600 leaf")가 기계로 강제되지 않았다(2026-09-07 적대 리뷰 P0,
+    두 리뷰어 독립 지적).
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+    assert driver.verify_leaf(leaf) == 0
+
+    # (a) 디렉터리가 group/other에 열려 있다.
+    leaf.chmod(0o755)
+    assert driver.verify_leaf(leaf) == 1
+    assert "trusted root-owned artifact" in capsys.readouterr().out
+    leaf.chmod(0o700)
+
+    # (b) leaf가 symlink다.
+    link = tmp_path / "link"
+    link.symlink_to(leaf, target_is_directory=True)
+    assert driver.verify_leaf(link) == 1
+
+    # (c) 안쪽 파일이 group/other에 열려 있다.
+    (leaf / "result.json").chmod(0o644)
+    assert driver.verify_leaf(leaf) == 1
+    (leaf / "result.json").chmod(0o600)
+
+    # (d) 다른 신원 소유의 디렉터리(테스트는 비-root로 도므로 /etc가 그 예다).
+    assert driver.verify_leaf(Path("/etc")) == 1
+
+    # (e) 소유자 대조 자체 — 검증기가 다른 신원으로 돈다고 보면 자기 leaf도 거부한다.
+    monkeypatch.setattr(driver.os, "geteuid", lambda: os.getuid() + 1)
+    assert driver.verify_leaf(leaf) == 1
+    assert "신원의 소유가 아니다" in capsys.readouterr().out
+
+
+def test_verify_leaf_requires_the_root_only_ledger_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """공개값만으로 조립한 leaf는 통과하지 못해야 한다.
+
+    L3~L6이 대조하는 값은 전부 `-public` 사본에서 world-readable이다(n150 실측
+    0644). 그래서 그것만으로는 위조 문턱이 "공개값 베끼기"에 그친다. ledger는
+    root-only 0700이고 드라이버가 실행 **전에** O_EXCL로 claim을 남기므로, claim의
+    실재가 특권 생산자의 실제 실행을 뜻한다.
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, ledger_claim=False
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    out = capsys.readouterr().out
+    assert "FAIL L9 root-only ledger claim" in out
+    assert "present=False" in out
+
+
+def test_leaf_ledger_claim_name_matches_the_planner(tmp_path: Path) -> None:
+    """검증기의 claim 이름 계산이 planner의 정본과 **바이트 단위로** 같아야 한다.
+
+    두 곳이 어긋나면 L9가 조용히 항상 실패한다 — 그러면 이 축은 "아무 leaf도
+    통과 못 한다"가 되어 결국 걷히게 된다. 그래서 값이 아니라 두 구현을 결박한다.
+    """
+
+    from kor_travel_docker_manager.services.m05_isolated_harness import (
+        M05_ISOLATED_HARNESS_KIND,
+        M05_ISOLATED_HARNESS_VERSION,
+    )
+
+    driver = _driver()
+    assert driver._HARNESS_NAME == M05_ISOLATED_HARNESS_KIND
+    assert driver._HARNESS_VERSION == M05_ISOLATED_HARNESS_VERSION
+
+    payload = {
+        "harness": M05_ISOLATED_HARNESS_KIND,
+        "manager_source_revision": "b" * 40,
+        "execution_identity_sha256": "c" * 64,
+        "pinset_sha256": "d" * 64,
+        "version": M05_ISOLATED_HARNESS_VERSION,
+    }
+    expected = hashlib.sha256(
+        (
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            + "\n"
+        ).encode("ascii")
+    ).hexdigest()
+    assert (
+        driver._leaf_ledger_claim_name(
+            manager_source_revision="b" * 40,
+            execution_identity_sha256="c" * 64,
+            pinset_sha256="d" * 64,
+        )
+        == expected
+    )
+
+
+def test_verify_leaf_binds_the_m04_evidence_into_the_hash_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """M04 증적이 사슬 안에 있어야 한다.
+
+    종전에는 M04 파일을 L2가 해시만 하고 **한 번도 열지 않았고**, 그것을 대신
+    주장하는 L7은 payload의 자유 불리언 하나였다. m05 attestation payload가 이미
+    `m04_attestation_sha256`을 들고 있으므로 그것을 L2의 재계산 값과 대조한다.
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, m04_attestation_sha="e" * 64
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "FAIL L7b M04 증적이 사슬 안에 있다" in capsys.readouterr().out
+
+
+def test_verify_leaf_refuses_a_leaf_whose_own_identity_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """L8은 **leaf 자신의** identity 차단을 봐야 한다.
+
+    종전에는 `current`의 차단만 봤다. 승격 후보는 둘 다 current가 아닌 identity라,
+    그 leaf가 소각됐어도 L8이 통과했다(2026-09-07 적대 리뷰 P0).
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, blocked_identities=("c" * 64,)
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    out = capsys.readouterr().out
+    assert "FAIL L8" in out
+    assert "leaf_execution_blocked=True" in out

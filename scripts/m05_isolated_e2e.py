@@ -2249,6 +2249,7 @@ def rotation_preflight(map_revision: str, pinvi_revision: str) -> int:
 #: leaf가 스스로 밝히는 하네스 이름. 결과 기록과 검증이 같은 상수를 쓴다 —
 #: 두 곳에 리터럴로 적으면 한쪽만 바뀌어도 검증이 조용히 통과한다.
 _HARNESS_NAME = "m05-isolated-bridge-v1"
+_HARNESS_VERSION = 1
 
 #: leaf가 담는 세 증적의 상대 경로. `result.json`의 세 해시가 각각 이것을 가리킨다.
 _LEAF_HASHED_ARTIFACTS = {
@@ -2258,9 +2259,116 @@ _LEAF_HASHED_ARTIFACTS = {
 }
 
 
-def _leaf_json(path: Path) -> object:
-    with path.open("rb") as handle:
-        return json.loads(handle.read())
+def _leaf_ledger_claim_name(
+    *,
+    manager_source_revision: str,
+    execution_identity_sha256: str,
+    pinset_sha256: str,
+) -> str:
+    """leaf 값에서 ledger claim 파일 이름을 다시 계산한다.
+
+    payload 모양은 `M05IsolatedHarnessPlan.claim_bytes`(services/m05_isolated_harness.py)
+    가 정본이고 여기서 그것을 재현한다. 두 곳이 어긋나면 이 축이 조용히 항상
+    실패하므로 `test_leaf_ledger_claim_name_matches_the_planner`가 둘을 결박한다.
+    """
+
+    payload = {
+        "harness": _HARNESS_NAME,
+        "manager_source_revision": manager_source_revision,
+        "execution_identity_sha256": execution_identity_sha256,
+        "pinset_sha256": pinset_sha256,
+        "version": _HARNESS_VERSION,
+    }
+    raw = (
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
+
+
+class _UntrustedLeaf(Exception):
+    """leaf가 특권 생산자의 산물이라는 증거가 없다."""
+
+
+def _trusted_leaf_bytes(path: Path) -> bytes:
+    """leaf 파일을 **소유자·권한·symlink를 확인하고** 한 번만 읽는다.
+
+    종전에는 `path.open("rb")`였다 — symlink를 그대로 따라가고 소유자도 mode도
+    보지 않았다. 그래서 `--verify-leaf`가 사실상 **아무 디렉터리나** 받았고,
+    "root-owned 0600 leaf"라는 근거가 기계로 강제되지 않았다(2026-09-07 적대 리뷰
+    P0, 두 리뷰어 모두 독립 지적).
+
+    소유자는 **검증기를 돌리는 euid**와 대조한다. `__main__`이 `os.geteuid() != 0`이면
+    `SystemExit(2)`로 막으므로(스크립트 하단) 프로덕션에서 그 euid는 항상 root다.
+    리터럴 0으로 박지 않는 이유는 그래야 이 축을 비-root 테스트가 **실제로** 잴 수
+    있기 때문이다 — 우회 플래그를 두면 그 플래그가 곧 게이트를 없앤다.
+
+    저장소는 다른 trusted artifact마다 이미 이 규율을 쓴다
+    (`_secure_read_root_file`, `runtime_execution_registry._read_trusted_text`,
+    `runtime_pin_registry._assert_registry_file_integrity`). 승격을 정의하는 이
+    함수만 빠져 있었다.
+
+    **바이트를 한 번만 읽어 돌려준다.** 종전에는 해시용으로 한 번, 파싱용으로 또
+    한 번 열어 그 사이에 파일이 바뀔 수 있었다(TOCTOU).
+    """
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise _UntrustedLeaf("O_NOFOLLOW를 쓸 수 없는 플랫폼이다")
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise _UntrustedLeaf(f"{path.name}: 읽을 수 없다") from error
+    if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+        raise _UntrustedLeaf(f"{path.name}: 정규 파일이 아니다")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise _UntrustedLeaf(f"{path.name}: 검사와 읽기 사이에 바뀌었다")
+        # 이 uid 검사는 **심층 방어**다. `_assert_trusted_leaf_root`가 디렉터리를
+        # 0700 + 특권 신원 소유로 요구하므로 그 안에 다른 uid가 파일을 만들 수
+        # 없다 — 그래서 비-root 테스트로 이 축만 따로 뒤집는 변이를 만들 수 없다
+        # (실제로 시도했고 초록이었다). 가짜 게이트를 붙이는 대신 사실을 적는다:
+        # 이 줄이 지키는 것은 디렉터리 검사가 우회됐을 때뿐이다.
+        if opened.st_uid != os.geteuid():
+            raise _UntrustedLeaf(
+                f"{path.name}: 검증기를 돌리는 신원의 소유가 아니다(uid={opened.st_uid})"
+            )
+        if stat.S_IMODE(opened.st_mode) & 0o077:
+            raise _UntrustedLeaf(
+                f"{path.name}: mode {stat.S_IMODE(opened.st_mode):04o} — group/other에 열려 있다"
+            )
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+            if sum(len(part) for part in chunks) > 8_000_000:
+                raise _UntrustedLeaf(f"{path.name}: 너무 크다")
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def _assert_trusted_leaf_root(leaf: Path) -> None:
+    """leaf 디렉터리가 root 소유이고 group/other에 닫혀 있어야 한다.
+
+    드라이버는 출력 디렉터리에 `_root_directory(output)`를 걸고 시작한다 —
+    검증기가 같은 것을 요구하지 않으면 그 규율이 사후에 아무 의미가 없다.
+    """
+
+    try:
+        metadata = leaf.lstat()
+    except OSError as error:
+        raise _UntrustedLeaf(f"{leaf}: 없거나 읽을 수 없다") from error
+    if leaf.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise _UntrustedLeaf(f"{leaf}: 디렉터리가 아니다")
+    if metadata.st_uid != os.geteuid():
+        raise _UntrustedLeaf(
+            f"{leaf}: 검증기를 돌리는 신원의 소유가 아니다(uid={metadata.st_uid})"
+        )
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise _UntrustedLeaf(
+            f"{leaf}: mode {stat.S_IMODE(metadata.st_mode):04o} — group/other에 열려 있다"
+        )
 
 
 def _leaf_object(value: object, *, name: str) -> dict[str, object]:
@@ -2298,10 +2406,17 @@ def verify_leaf(leaf: Path) -> int:
         checks.append((name, ok, detail))
 
     try:
-        result = _leaf_object(_leaf_json(leaf / "result.json"), name="leaf result")
+        _assert_trusted_leaf_root(leaf)
+        result = _leaf_object(
+            json.loads(_trusted_leaf_bytes(leaf / "result.json")), name="leaf result"
+        )
+    except _UntrustedLeaf as error:
+        print(f"leaf is not a trusted root-owned artifact: {error}", flush=True)
+        return 1
     except (OSError, TypeError, ValueError):
         print("leaf result.json is unreadable", flush=True)
         return 1
+    record("L0 leaf 신뢰 경계", True, f"root-owned 비공개 디렉터리 {leaf}")
 
     record(
         "L1 harness/status/phase",
@@ -2312,13 +2427,16 @@ def verify_leaf(leaf: Path) -> int:
         f"phase={result.get('phase')}",
     )
 
+    # 해시한 **그 바이트**를 뒤에서 그대로 파싱한다 — 두 번 열면 그 사이에 바뀔 수 있다.
+    hashed_bytes: dict[str, bytes] = {}
     for field, relative in _LEAF_HASHED_ARTIFACTS.items():
-        path = leaf / relative
         try:
-            actual = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            record(f"L2 {relative}", False, "파일을 읽지 못했다")
+            raw = _trusted_leaf_bytes(leaf / relative)
+        except _UntrustedLeaf as error:
+            record(f"L2 {relative}", False, f"신뢰 읽기 실패: {error}")
             continue
+        hashed_bytes[field] = raw
+        actual = hashlib.sha256(raw).hexdigest()
         record(
             f"L2 {relative}",
             actual == result.get(field),
@@ -2327,16 +2445,15 @@ def verify_leaf(leaf: Path) -> int:
 
     try:
         attestation = _leaf_object(
-            _leaf_json(leaf / _LEAF_HASHED_ARTIFACTS["m05_attestation_sha256"]),
-            name="m05 attestation",
+            json.loads(hashed_bytes["m05_attestation_sha256"]), name="m05 attestation"
         )
         payload = _leaf_object(attestation.get("payload"), name="m05 attestation payload")
         provenance = _leaf_object(
-            _leaf_json(leaf / _LEAF_HASHED_ARTIFACTS["runtime_provenance_sha256"]),
+            json.loads(hashed_bytes["runtime_provenance_sha256"]),
             name="isolated runtime provenance",
         )
         provenance_map = _leaf_object(provenance.get("map"), name="provenance map")
-    except (OSError, TypeError, ValueError):
+    except (KeyError, OSError, TypeError, ValueError):
         print("leaf attestation/provenance is unreadable", flush=True)
         return 1
 
@@ -2370,7 +2487,13 @@ def verify_leaf(leaf: Path) -> int:
     try:
         execution = load_runtime_execution_registry()
         bindings = (execution.current, *execution.history)
-        execution_blocked = execution.is_unconditionally_blocked_current()
+        # **leaf 자신의** identity가 차단됐는지를 본다. 종전에는 `current`만 봤는데
+        # 승격 후보는 둘 다 current가 아닌 identity라, 그 leaf가 소각됐어도 L8이
+        # 통과했다(2026-09-07 적대 리뷰 P0).
+        execution_blocked = any(
+            entry.execution_identity_sha256 == leaf_identity
+            for entry in execution.blocked_executions
+        ) or execution.is_unconditionally_blocked_current()
         is_current = execution.current.execution_identity_sha256 == leaf_identity
         bound = next(
             (
@@ -2430,6 +2553,43 @@ def verify_leaf(leaf: Path) -> int:
         f"m04_server_side_chain_verified={payload.get('m04_server_side_chain_verified')}",
     )
 
+    # L7이 자유 불리언 하나였다 — 그것이 주장하는 M04 증적 파일은 L2가 해시만 하고
+    # **한 번도 열지 않았다.** m05 attestation payload가 이미 `m04_attestation_sha256`을
+    # 들고 있으므로 그것을 L2가 재계산한 값과 대조하면 M04가 사슬에 들어온다
+    # (2026-09-07 적대 리뷰 P0-3: "공짜로 쓸 수 있는 결박을 버렸다").
+    record(
+        "L7b M04 증적이 사슬 안에 있다",
+        payload.get("m04_attestation_sha256") == result.get("m04_attestation_sha256"),
+        f"attestation={payload.get('m04_attestation_sha256')} "
+        f"result={result.get('m04_attestation_sha256')}",
+    )
+
+    # **닻.** L3~L6이 대조하는 값은 전부 `-public` 사본에서 world-readable이라
+    # (n150 실측 0644) 공개값만으로 조립한 leaf가 L1~L7을 통과할 수 있다. ledger는
+    # root-only 0700이고 드라이버가 실행 **전에** O_EXCL로 claim을 남기므로, claim의
+    # 실재는 "특권 생산자가 이 (identity, pinset, Manager)로 실제 실행했다"를 뜻한다.
+    # 파일 이름은 공개값에서 계산되지만 **만들려면 root여야 한다** — 위조 문턱을
+    # "공개값 베끼기"에서 "root"로 올린다. 그 이상을 주장하지 않는다.
+    claim = _leaf_ledger_claim_name(
+        manager_source_revision=str(result.get("manager_source_revision") or ""),
+        execution_identity_sha256=str(leaf_identity or ""),
+        pinset_sha256=str(result.get("source_pinset_sha256") or ""),
+    )
+    try:
+        _assert_trusted_leaf_root(_LEDGER)
+        claim_metadata = (_LEDGER / claim).lstat()
+        claim_present = (
+            stat.S_ISREG(claim_metadata.st_mode)
+            and claim_metadata.st_uid == os.geteuid()
+        )
+    except (OSError, _UntrustedLeaf):
+        claim_present = False
+    record(
+        "L9 root-only ledger claim",
+        claim_present,
+        f"ledger={_LEDGER} claim={claim[:16]}… present={claim_present}",
+    )
+
     try:
         blocked = load_runtime_pin_registry().is_unconditionally_blocked_pinset(
             PINNED_RUNTIME_RELEASE.pinset_sha256
@@ -2439,7 +2599,7 @@ def verify_leaf(leaf: Path) -> int:
     record(
         "L8 terminal 아님",
         not blocked and not execution_blocked,
-        f"pinset_blocked={blocked} execution_blocked={execution_blocked}",
+        f"pinset_blocked={blocked} leaf_execution_blocked={execution_blocked}",
     )
 
     for name, ok, detail in checks:
