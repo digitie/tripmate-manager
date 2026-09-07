@@ -978,6 +978,7 @@ def _rehearsal_probes(
     pg_restore_stderr: bytes = b"",
     restored_head: str | None = "0001_head",
     restored_size: int = 12345,
+    catalog_digests: tuple[str | None, str | None] = ("cat-same", "cat-same"),
 ) -> list[list[str]]:
     """createdb/pg_restore/cleanup을 가짜로 응답하고, cleanup 호출을 기록한다."""
 
@@ -986,6 +987,11 @@ def _rehearsal_probes(
     monkeypatch.setattr(standalone_backup, "_query_db_size", lambda *a, **k: restored_size)
     monkeypatch.setattr(
         standalone_backup, "_discover_alembic_head", lambda *a, **k: restored_head
+    )
+    # (복원본, 운영본) 순으로 답한다 — 리허설이 그 순서로 두 번 부른다.
+    digest_calls = iter(catalog_digests)
+    monkeypatch.setattr(
+        standalone_backup, "catalog_digest", lambda *a, **k: next(digest_calls, None)
     )
     # 오래된 scratch DB 스윕은 별도 테스트에서 다룬다 — 여기서는 항상 없다고 답한다.
     monkeypatch.setattr(
@@ -1322,3 +1328,114 @@ def test_rehearse_standalone_restore_reports_swept_stale_databases_as_a_finding(
 
     assert "STALE_REHEARSAL_DATABASES_CLEANED" in [f.code for f in outcome.findings]
     assert outcome.verified is True
+
+
+def test_rehearse_restore_does_not_strip_ownership_from_the_scratch_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--no-owner --no-privileges`가 붙으면 소유권 보존을 **물을 수 없다.**
+
+    그 둘이 붙어 있는 한 복원본의 소유자·ACL은 항상 실행자의 것이 되므로, 리허설이
+    증명하는 것이 "행이 들어갔다"에 그친다. n150 실측에서 정확히 그것 때문에 카탈로그
+    대조가 항상 어긋났다(2026-09-08).
+    """
+
+    root = tmp_path / "geo"
+    root.mkdir()
+    _seed_backup(root, "geo", 1000, b"dump-bytes")
+    _rehearsal_probes(monkeypatch)
+
+    rehearse_standalone_restore("geo", backup_root=root)
+
+    restore_command = next(
+        command for command in REHEARSAL_COMMANDS if "pg_restore" in command
+    )
+    assert "--no-owner" not in restore_command
+    assert "--no-privileges" not in restore_command
+    # 반쯤 복원된 DB를 조용히 통과시키지 않는다.
+    assert "--exit-on-error" in restore_command
+
+
+def test_rehearse_restore_flags_catalog_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """소유권·ACL이 원본과 다르면 finding을 남긴다."""
+
+    root = tmp_path / "geo"
+    root.mkdir()
+    _seed_backup(root, "geo", 1000, b"dump-bytes")
+    _rehearsal_probes(monkeypatch, catalog_digests=("cat-restored", "cat-live"))
+
+    outcome = rehearse_standalone_restore("geo", backup_root=root)
+
+    assert "REHEARSAL_CATALOG_DRIFT" in [f.code for f in outcome.findings]
+    assert outcome.restored_catalog_digest == "cat-restored"
+    assert outcome.live_catalog_digest == "cat-live"
+
+
+def test_rehearse_restore_does_not_read_an_unreadable_catalog_as_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """지문을 못 읽으면 **통과가 아니다.**
+
+    둘 다 `None`이면 소박한 동등 비교는 '같다'가 되는데, 그것이 정확히 이 도구가
+    막으려는 침묵이다.
+    """
+
+    root = tmp_path / "geo"
+    root.mkdir()
+    _seed_backup(root, "geo", 1000, b"dump-bytes")
+    _rehearsal_probes(monkeypatch, catalog_digests=(None, None))
+
+    outcome = rehearse_standalone_restore("geo", backup_root=root)
+
+    assert "REHEARSAL_CATALOG_UNKNOWN" in [f.code for f in outcome.findings]
+    assert "REHEARSAL_CATALOG_DRIFT" not in [f.code for f in outcome.findings]
+
+
+def test_rehearse_restore_reports_a_matching_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """같으면 drift도 unknown도 남기지 않는다 — n150 실측이 이 상태였다."""
+
+    root = tmp_path / "geo"
+    root.mkdir()
+    _seed_backup(root, "geo", 1000, b"dump-bytes")
+    _rehearsal_probes(monkeypatch)
+
+    outcome = rehearse_standalone_restore("geo", backup_root=root)
+
+    codes = [f.code for f in outcome.findings]
+    assert "REHEARSAL_CATALOG_DRIFT" not in codes
+    assert "REHEARSAL_CATALOG_UNKNOWN" not in codes
+    assert outcome.restored_catalog_digest == outcome.live_catalog_digest
+
+
+def test_catalog_digest_sql_pins_the_two_properties_execution_proved() -> None:
+    """SQL이 `search_path`를 고정하고 ACL을 `acldefault()`로 정규화하는지 본다.
+
+    **이 게이트의 한계를 먼저 적는다.** 위 리허설 테스트들은 `catalog_digest`를 통째로
+    monkeypatch하므로 SQL이 한 줄도 돌지 않는다 — 그래서 두 속성을 지우는 변이가 그
+    테스트들에서는 초록이다(실제로 확인했다). 여기서는 **텍스트로** 잡는다.
+
+    두 속성의 진짜 증명은 n150 실측이다(2026-09-08):
+
+    - `search_path`를 고정하지 않으면 `pg_get_function_identity_arguments()`가 세션에
+      따라 `geometry`와 `x_extension.geometry`를 오가, 소유권이 완전히 같은데도
+      PostGIS 함수 **495건**이 어긋났다.
+    - ACL을 정규화하지 않으면 `relacl`이 NULL인 복원본과 소유자 기본 권한이 명시된
+      운영본이 **의미가 같은데도** 어긋났다(마지막까지 남은 1건).
+
+    거짓 양성은 진짜 drift를 덮으므로 없는 것보다 나쁘다. 그래서 지우면 안 된다.
+    """
+
+    sql = standalone_backup._CATALOG_DIGEST_SQL
+    assert "SET LOCAL search_path = pg_catalog;" in sql
+    # 세 종류 ACL이 전부 정규화돼야 한다 — 하나만 빠져도 그 종류에서 거짓 양성이 난다.
+    assert "c.relacl," in sql
+    assert "acldefault(" in sql
+    assert "coalesce(p.proacl, acldefault(" in sql
+    assert "coalesce(n.nspacl, acldefault(" in sql
+    # `acldefault`의 첫 인자는 `"char"`다 — 캐스트가 없으면 함수를 못 찾아 지문이
+    # 통째로 `None`이 되고, 그것이 '읽지 못함'으로 조용히 새어 나간다.
+    assert sql.count('::"char"') >= 3
