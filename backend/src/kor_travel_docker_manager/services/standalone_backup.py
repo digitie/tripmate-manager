@@ -1012,8 +1012,13 @@ def rehearse_standalone_restore(
                     str(port),
                     "--dbname",
                     scratch_database,
-                    "--no-owner",
-                    "--no-privileges",
+                    # **`--no-owner --no-privileges`를 쓰지 않는다.** 그 둘은 소유권과
+                    # ACL을 벗겨내므로, 붙인 채로는 "복원본이 원본과 같은 소유권을
+                    # 갖는가"를 **구조적으로 물을 수 없다** — 리허설이 증명하는 것이
+                    # "행이 들어갔다"에 그치게 된다. scratch DB는 원본과 **같은
+                    # 인스턴스** 안에 만들므로 dump가 참조하는 role은 전부 실재한다.
+                    # `--exit-on-error`가 남아 있어 GRANT 하나만 실패해도 시끄럽게
+                    # 죽는다 — 조용히 반쯤 복원된 DB를 통과시키지 않는다.
                     "--exit-on-error",
                     container_dump_path,
                 ],
