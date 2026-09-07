@@ -767,6 +767,11 @@ class RehearsalOutcome:
     restored_db_size_bytes: int | None
     duration_sec: float | None
     findings: tuple[RestorePlanFinding, ...]
+    #: 복원된 scratch DB와 **현재 운영 DB**의 카탈로그 지문. 같으면 소유권·ACL·
+    #: routine 보안 속성이 살아남았다는 뜻이다. `None`은 "읽지 못했다"이지
+    #: "같다"가 아니다.
+    restored_catalog_digest: str | None = None
+    live_catalog_digest: str | None = None
 
     @property
     def verified(self) -> bool:
@@ -942,6 +947,8 @@ def rehearse_standalone_restore(
 
     findings: list[RestorePlanFinding] = []
     restore_succeeded: bool | None = None
+    restored_catalog_digest: str | None = None
+    live_catalog_digest: str | None = None
     restored_alembic_head: str | None = None
     restored_db_size_bytes: int | None = None
     started = time.monotonic()
@@ -1027,6 +1034,36 @@ def rehearse_standalone_restore(
                 restored_db_size_bytes = _query_db_size(
                     container_name, port, admin_name, scratch_database
                 )
+                # **소유권·ACL이 살아남았는가.** 지금까지 리허설은 "pg_restore가
+                # exit 0이고 head·크기가 말이 된다"까지만 봤다 — 그것은 행이
+                # 들어갔다를 뜻하지, SECURITY DEFINER 소유자와 relation ACL이
+                # 그대로라를 뜻하지 않는다. 복원이 "됐다"고 말하려면 그것까지 같아야
+                # 한다(T-VN-M05-2 C단계).
+                restored_catalog_digest = catalog_digest(
+                    container_name, port, admin_name, scratch_database
+                )
+                live_catalog_digest = catalog_digest(
+                    container_name, port, admin_name, _role_config(role)[1]
+                )
+                if restored_catalog_digest is None or live_catalog_digest is None:
+                    findings.append(
+                        RestorePlanFinding(
+                            "REHEARSAL_CATALOG_UNKNOWN",
+                            "카탈로그 지문을 읽지 못해 소유권·ACL이 복원됐는지 "
+                            "확인할 수 없습니다. 읽지 못한 것은 통과가 아닙니다.",
+                            False,
+                        )
+                    )
+                elif restored_catalog_digest != live_catalog_digest:
+                    findings.append(
+                        RestorePlanFinding(
+                            "REHEARSAL_CATALOG_DRIFT",
+                            "복원된 DB의 소유권·ACL·routine 보안 속성이 현재 DB와 "
+                            "다릅니다. 행은 들어갔더라도 그 상태로는 런타임이 "
+                            "자기 표를 읽지 못할 수 있습니다.",
+                            False,
+                        )
+                    )
                 restored_alembic_head = _discover_alembic_head(
                     container_name, port, admin_name, scratch_database
                 )
@@ -1152,6 +1189,8 @@ def rehearse_standalone_restore(
         restored_db_size_bytes=restored_db_size_bytes,
         duration_sec=duration_sec,
         findings=tuple(findings),
+        restored_catalog_digest=restored_catalog_digest,
+        live_catalog_digest=live_catalog_digest,
     )
 
 
@@ -1379,6 +1418,90 @@ def _pg_dump_already_running(
             f"{database_name} pg_dump activity check returned an unexpected value"
         )
     return int(output) > 0
+
+
+#: 복원된 DB가 **원본과 같은 소유권·권한·routine 보안 속성**을 갖는지 재는 지문.
+#:
+#: 리허설은 지금까지 "pg_restore가 exit 0이고 alembic head와 크기가 말이 된다"까지만
+#: 봤다. 그것은 **행이 들어갔다**를 뜻하지 소유권·ACL이 살아남았다를 뜻하지 않는다 —
+#: SECURITY DEFINER 프로시저의 소유자가 바뀌면 그 프로시저는 다른 권한으로 돌고,
+#: relation ACL이 비면 런타임이 자기 표를 못 읽는다. 복원이 "됐다"고 말하려면
+#: 그것까지 같아야 한다.
+#:
+#: **role에 무관하다** — 특정 프로젝트의 relation 이름을 알지 않고 카탈로그를 그대로
+#: 훑는다(Manager 범용성 유지).
+_CATALOG_DIGEST_SQL = """
+SELECT string_agg(line, E'
+' ORDER BY line) FROM (
+    SELECT format('r|%s|%s|%s|%s|%s',
+        n.nspname, c.relname, c.relkind,
+        pg_get_userbyid(c.relowner),
+        coalesce(array_to_string(c.relacl::text[], ','), '')
+    ) AS line
+    FROM pg_catalog.pg_class AS c
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+      AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+    UNION ALL
+    SELECT format('f|%s|%s|%s|%s|%s|%s',
+        n.nspname, p.proname,
+        pg_catalog.pg_get_function_identity_arguments(p.oid),
+        pg_get_userbyid(p.proowner), p.prosecdef,
+        coalesce(array_to_string(p.proacl::text[], ','), '')
+    )
+    FROM pg_catalog.pg_proc AS p
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+    UNION ALL
+    SELECT format('n|%s|%s|%s',
+        n.nspname, pg_get_userbyid(n.nspowner),
+        coalesce(array_to_string(n.nspacl::text[], ','), '')
+    )
+    FROM pg_catalog.pg_namespace AS n
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+    UNION ALL
+    SELECT format('e|%s|%s', extname, extversion)
+    FROM pg_catalog.pg_extension
+) AS catalog_line
+"""
+
+
+def catalog_digest(
+    container_name: str, port: int, admin_name: str, database_name: str
+) -> str | None:
+    """카탈로그 지문을 읽는다. 읽지 못하면 `None`이고 **통과로 읽지 않는다.**"""
+
+    completed = subprocess.run(  # noqa: S603
+        [
+            "docker",
+            "exec",
+            "--user",
+            "postgres",
+            container_name,
+            "psql",
+            "--username",
+            admin_name,
+            "--port",
+            str(port),
+            "--dbname",
+            database_name,
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            _CATALOG_DIGEST_SQL,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    if completed.returncode != 0:
+        return None
+    payload = completed.stdout.strip()
+    if not payload:
+        return None
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _discover_alembic_head(
