@@ -2385,6 +2385,25 @@ def _leaf_object(value: object, *, name: str) -> dict[str, object]:
     return value
 
 
+def _report(checks: list[tuple[str, bool, str]]) -> int:
+    """잰 축을 전부 인쇄하고 종료코드를 낸다.
+
+    조기 return 경로에서도 이것을 써야 한다 — 종전에는 m05 attestation이나
+    provenance가 거부되면 이미 잰 L0·L1·L2 세 줄이 **한 줄도 인쇄되지 않고**
+    한 문장만 남았다. 3차 리뷰가 고친 "이유 없는 exit 1"이 세 파일 중 둘에서
+    되살아나 있었다(5차 적대 리뷰 P1).
+    """
+
+    for name, ok, detail in checks:
+        print(f"{'PASS' if ok else 'FAIL'} {name} — {detail}", flush=True)
+    failed = [name for name, ok, _ in checks if not ok]
+    if failed:
+        print(f"leaf verification FAILED: {', '.join(failed)}", flush=True)
+        return 1
+    print("leaf verification PASSED", flush=True)
+    return 0
+
+
 def verify_leaf(leaf: Path) -> int:
     """격리 M05 leaf를 **현재 pin registry와 다시 계산해** 대조한다.
 
@@ -2427,10 +2446,22 @@ def verify_leaf(leaf: Path) -> int:
     except (OSError, TypeError, ValueError):
         print("leaf result.json is unreadable", flush=True)
         return 1
+    # 검사 범위를 **정확히** 적는다. 종전 문구는 "증적 하위 디렉터리 포함"이라
+    # 적어 leaf 안 전체를 잰 것처럼 읽혔지만, 실제로는 leaf 루트와 증적 파일들의
+    # 부모 넷만 본다. 드라이버는 일회용 PinVi 체크아웃 제거 실패를 일부러
+    # cleanup 실패로 올리지 않으므로, `status=passed` leaf 안에 임의 모드의
+    # `runtime/pinvi-run-<uuid>/`가 남을 수 있다(5차 적대 리뷰 P1).
     record(
         "L0 leaf 신뢰 경계",
         True,
-        f"root-owned 0700 트리 {leaf} (증적 하위 디렉터리 포함)",
+        f"root-owned 0700: {leaf} 와 증적 파일의 부모 디렉터리 "
+        f"{sorted({str(Path(v).parent) for v in _LEAF_HASHED_ARTIFACTS.values()})}",
+    )
+    # 드라이버가 그 사실을 receipt에 싣는데 종전에는 아무 축도 읽지 않았다.
+    record(
+        "L0b 일회용 worktree가 남지 않았다",
+        result.get("disposable_run_worktree_retained") is not True,
+        f"disposable_run_worktree_retained={result.get('disposable_run_worktree_retained')}",
     )
 
     record(
@@ -2472,9 +2503,9 @@ def verify_leaf(leaf: Path) -> int:
         )
         provenance_map = _leaf_object(provenance.get("map"), name="provenance map")
         provenance_pinvi = _leaf_object(provenance.get("pinvi"), name="provenance pinvi")
-    except (KeyError, OSError, TypeError, ValueError):
-        print("leaf attestation/provenance is unreadable", flush=True)
-        return 1
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        record("L2 attestation/provenance 판독", False, f"{type(error).__name__}: {error}")
+        return _report(checks)
 
     map_source = PINNED_RUNTIME_RELEASE.source_for("map")
     pinvi_source = PINNED_RUNTIME_RELEASE.source_for("pinvi")
@@ -2666,14 +2697,7 @@ def verify_leaf(leaf: Path) -> int:
         f"pinset_blocked={blocked} leaf_execution_blocked={execution_blocked}",
     )
 
-    for name, ok, detail in checks:
-        print(f"{'PASS' if ok else 'FAIL'} {name} — {detail}", flush=True)
-    failed = [name for name, ok, _ in checks if not ok]
-    if failed:
-        print(f"leaf verification FAILED: {', '.join(failed)}", flush=True)
-        return 1
-    print("leaf verification PASSED", flush=True)
-    return 0
+    return _report(checks)
 
 def preflight(expected_revision: str) -> int:
     """launcher용 비소비 source-materialization preflight; terminal/ledger를 쓰지 않는다.
