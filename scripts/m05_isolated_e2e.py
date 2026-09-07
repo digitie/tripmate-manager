@@ -2943,6 +2943,21 @@ def _build_runtime_provenance(
     return _write_private_json(path, provenance)
 
 
+def driver_exit_code(*, completed: bool, receipt_write_failed: bool) -> int:
+    """드라이버의 종료 코드 규칙.
+
+    본문이 통과했더라도 **receipt를 남기지 못했으면 성공이 아니다.** launcher는
+    `result.json`으로만 결과를 관측하므로, 파일이 없는데 0을 돌려주면 launcher는
+    "성공했는데 증적이 사라졌다"와 "애초에 실행되지 않았다"를 구별할 수 없다.
+
+    이 규칙이 함수로 나와 있는 이유는 결박 때문이다. 규칙이 `main`의 `finally`
+    뒤 한 줄로만 있으면 그 줄을 지켜 주는 테스트를 쓰려면 본문 전체(docker/npm
+    15단계)를 성공시켜야 해서, 실제로는 아무도 지키지 않게 된다.
+    """
+
+    return 0 if completed and not receipt_write_failed else 1
+
+
 def main(expected_revision: str, output: Path) -> int:
     phase = "admission"
     completed = False
@@ -2974,6 +2989,7 @@ def main(expected_revision: str, output: Path) -> int:
     private_files: tuple[Path, ...] = ()
     result_hashes: dict[str, str] = {}
     disposable_run_worktree: _DisposableRunWorktree | None = None
+    receipt_write_failed = False
     try:
         os.umask(0o077)
         _validate_trusted_release(expected_revision)
@@ -4003,8 +4019,16 @@ def main(expected_revision: str, output: Path) -> int:
         try:
             _write_private_json(output / "result.json", result)
         except (OSError, _PhaseError):
-            return 1
-    return 0 if completed else 1
+            receipt_write_failed = True
+    # `finally` 안에서 return하면 **전파 중인 BaseException을 삼킨다.** 위
+    # `except Exception`이 ordinary exception을 이미 잡으므로 여기까지 살아
+    # 오는 것은 KeyboardInterrupt/SystemExit뿐인데, 그것은 "root 운영자가
+    # 중단 신호를 보낼 수 있게" 일부러 안 잡은 바로 그 신호다. return을
+    # finally 밖으로 빼서 중단이 계속 전파되게 둔다. (Python 3.14가
+    # SyntaxWarning으로 이 결함을 매 실행마다 알리고 있었다.)
+    return driver_exit_code(
+        completed=completed, receipt_write_failed=receipt_write_failed
+    )
 
 
 if __name__ == "__main__":
