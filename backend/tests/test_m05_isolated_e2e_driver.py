@@ -3059,6 +3059,13 @@ def _verify_leaf_fixture(
     provenance_map_revision: str | None = None,
     m04_chain_verified: bool = True,
     provenance_identity: str | None = None,
+    provenance_transaction_id: str | None = None,
+    provenance_manager: str | None = None,
+    provenance_pinset: str | None = None,
+    binding_map_revision: str | None = None,
+    pinset_blocked: bool = False,
+    worktree_retained: bool = False,
+    drop_binding_key: str | None = None,
 ):
     """`--verify-leaf`가 읽는 leaf 한 벌과 그에 맞는 registry 대역을 만든다."""
 
@@ -3092,9 +3099,9 @@ def _verify_leaf_fixture(
         # 아래 넷이 L6b가 결박하는 축이다 — 실제 provenance 문서가 들고 있는 것과
         # 같은 키다(n150 실측으로 확인).
         "execution_identity_sha256": provenance_identity or (result_identity or identity),
-        "manager_source_revision": result_manager or manager_revision,
-        "pinset_sha256": leaf_pinset or pinned.pinset_sha256,
-        "transaction_id": transaction_id,
+        "manager_source_revision": provenance_manager or result_manager or manager_revision,
+        "pinset_sha256": provenance_pinset or leaf_pinset or pinned.pinset_sha256,
+        "transaction_id": provenance_transaction_id or transaction_id,
     }
     attestation = {
         "payload": {
@@ -3129,6 +3136,7 @@ def _verify_leaf_fixture(
                 "phase": "completed",
                 "pinset_sha256": leaf_pinset or pinned.pinset_sha256,
                 "transaction_id": transaction_id,
+                "disposable_run_worktree_retained": worktree_retained,
                 "manager_source_revision": result_manager or manager_revision,
                 "execution_identity_sha256": result_identity or identity,
                 "m04_attestation_sha256": m04_sha,
@@ -3137,6 +3145,19 @@ def _verify_leaf_fixture(
             }
         ).encode()
     )
+    if drop_binding_key is not None:
+        # **양쪽에서** 지운다. 한쪽만 지우면 두 dict가 달라져 동등성 비교가 잡으므로
+        # `all(value is not None ...)` 가드의 고유 영역이 재어지지 않는다.
+        raw = json.loads((leaf / "result.json").read_text(encoding="utf-8"))
+        raw.pop(drop_binding_key, None)
+        (leaf / "result.json").chmod(0o600)
+        (leaf / "result.json").write_bytes(json.dumps(raw).encode())
+        provenance.pop(drop_binding_key, None)
+        provenance_sha = write(
+            leaf / "runtime/isolated-runtime-provenance.json", provenance
+        )
+        raw["runtime_provenance_sha256"] = provenance_sha
+        (leaf / "result.json").write_bytes(json.dumps(raw).encode())
     (leaf / "result.json").chmod(0o600)
 
     # **root-only ledger claim.** 이것이 없으면 공개값만으로 조립한 leaf와 실제 실행이
@@ -3145,9 +3166,12 @@ def _verify_leaf_fixture(
     ledger = tmp_path / "ledger"
     ledger.mkdir(mode=0o700)
     if ledger_claim is not False:
+        # **attestation 쪽 identity**를 쓴다. `result_identity or identity`로 만들면
+        # result identity를 어긋내는 변이가 L9까지 함께 떨어뜨려 L5를 고립시킬 수
+        # 없다(5차 적대 리뷰가 변이로 확인했다 — L5 축 전체가 생존했다).
         claim = driver._leaf_ledger_claim_name(
             manager_source_revision=result_manager or manager_revision,
-            execution_identity_sha256=result_identity or identity,
+            execution_identity_sha256=identity,
             pinset_sha256=pinned.pinset_sha256,
         )
         (ledger / claim).write_bytes(b"claim\n")
@@ -3163,7 +3187,7 @@ def _verify_leaf_fixture(
         ) -> None:
             self.execution_identity_sha256 = execution_identity_sha256
             self.source_pinset_sha256 = pinset or pinned.pinset_sha256
-            self.map_revision = map_revision
+            self.map_revision = binding_map_revision or map_revision
             self.pinvi_revision = pinvi_revision
             self.manager_source_revision = manager or manager_revision
 
@@ -3202,7 +3226,7 @@ def _verify_leaf_fixture(
     class _Pins:
         @staticmethod
         def is_unconditionally_blocked_pinset(_sha: str) -> bool:
-            return False
+            return pinset_blocked
 
     return leaf, manager_revision, _Registry, _Pins, ledger
 
@@ -4233,3 +4257,156 @@ def test_verify_leaf_refuses_a_provenance_from_another_run(
 
     assert driver.verify_leaf(leaf) == 1
     assert "FAIL L6b provenance가 이 실행의 것이다" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_fail"),
+    [
+        # L5 — 14축 중 유일하게 고립 게이트가 하나도 없었다(5차 적대 리뷰가 변이로
+        # 확인: 술어 전체를 True로 바꿔도 21건 전부 초록이었다). 원인은 L5를
+        # 떨어뜨리던 세 테스트가 전부 다른 축을 함께 떨어뜨렸고, 단언이 PASS 줄에도
+        # 찍히는 문자열이라 축을 구분하지 못한 것이었다.
+        ({"result_identity": "7" * 64}, "L5 execution identity"),
+        ({"binding_map_revision": "8" * 40}, "L5 execution identity"),
+        # L8의 pinset 절반 — execution 절반만 게이트가 있었다.
+        ({"pinset_blocked": True}, "L8 terminal 아님"),
+        # L6b가 존재 이유로 내세운 필드가 정작 무방비였다.
+        ({"provenance_transaction_id": "b2" * 16}, "L6b provenance가 이 실행의 것이다"),
+        ({"provenance_manager": "c" * 40}, "L6b provenance가 이 실행의 것이다"),
+        ({"provenance_pinset": "d" * 64}, "L6b provenance가 이 실행의 것이다"),
+        # L0가 재지 않는 범위를 드라이버는 receipt에 싣는데 아무 축도 안 읽었다.
+        ({"worktree_retained": True}, "L0b 일회용 worktree가 남지 않았다"),
+        # 양쪽에서 함께 빠지면 동등성은 통과한다 — fail-close 가드의 고유 영역이다.
+        ({"drop_binding_key": "transaction_id"}, "L6b provenance가 이 실행의 것이다"),
+    ],
+)
+def test_verify_leaf_isolates_the_axes_that_survived_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    kwargs: dict[str, object],
+    expected_fail: str,
+) -> None:
+    """5차 적대 리뷰가 변이로 잡은 무방비 축들을 각각 고립해서 잰다.
+
+    `transaction_id`가 특히 중요하다 — 실제 위협(같은 pinset·같은 Manager의 **다른
+    실행**이 만든 provenance 끼워넣기)에서는 나머지 세 필드가 전부 같으므로
+    **그 필드만이 그 공격을 잡는다**. L6b를 신설한 바로 그 PR에서 게이트 없이 들어왔다.
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, **kwargs
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    out = capsys.readouterr().out
+    # **`FAIL <축>`을 단언한다.** 축 이름만 보면 PASS 줄에도 찍혀 아무것도 지키지 않는다.
+    assert f"FAIL {expected_fail}" in out
+
+
+def test_verify_leaf_refuses_when_the_pin_registry_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """pin registry를 못 읽으면 fail-close다 — 그 분기에도 게이트가 없었다."""
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+
+    def _raise() -> object:
+        raise driver.RuntimePinRegistryError("registry unreadable")
+
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", _raise)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "FAIL L8 terminal 아님" in capsys.readouterr().out
+
+
+def test_verify_leaf_prints_its_checks_even_when_an_evidence_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """증적 판독 실패에서도 이미 잰 축은 인쇄돼야 한다.
+
+    m04 파일이 거부되면 루프가 끝까지 돌아 이유가 찍히는데, m05 attestation이나
+    provenance가 같은 이유로 거부되면 `hashed_bytes` KeyError로 조기 return해
+    **L0·L1·L2 세 줄이 한 줄도 인쇄되지 않았다.** 3차 리뷰가 고친 "이유 없는 exit 1"이
+    세 파일 중 둘에서 되살아나 있었다(5차 적대 리뷰 P1).
+    """
+
+    driver = _driver()
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    (leaf / "runtime" / "m05" / "attestation.json").chmod(0o644)
+    assert driver.verify_leaf(leaf) == 1
+    out = capsys.readouterr().out
+    assert "FAIL L2 runtime/m05/attestation.json" in out
+    assert "PASS L0 leaf 신뢰 경계" in out
+    assert "0644 != 0600" in out
+
+
+def test_the_provenance_producer_and_the_verifier_agree_on_the_bound_keys() -> None:
+    """정본이 만드는 provenance에 검증기가 읽는 키가 전부 있어야 한다.
+
+    생산자는 `build_m05_isolated_runtime_provenance`이고 소비자는 verify_leaf의
+    L6·L6b인데, 소비자가 키를 **문자열 리터럴로 다시 적는다.** 둘을 잇는 것이 없으면
+    생산자에서 키 하나를 rename해도 양쪽 테스트가 초록인 채 L6b만 영구 FAIL이 된다 —
+    `test_leaf_ledger_claim_name_matches_the_planner`가 L9를 위해 막아 둔 실패 양식과
+    같은 것이다(5차 적대 리뷰 P1).
+
+    생산자를 실행하려면 image inspect 전체를 지어내야 하므로, 반환 dict의 **키**를
+    `ast`로 읽어 소비자가 읽는 키 집합과 대조한다. rename은 이 방식으로 잡히고,
+    값의 정합은 L6b가 런타임에 잡는다.
+    """
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "backend/src/kor_travel_docker_manager/services/m05_isolated_harness.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    builder = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "build_m05_isolated_runtime_provenance"
+    )
+    returned = next(
+        node.value
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+    )
+    produced_keys = {
+        key.value for key in returned.keys if isinstance(key, ast.Constant)
+    }
+
+    # verify_leaf의 L6·L6b가 provenance에서 읽는 키.
+    consumed_keys = {
+        "execution_identity_sha256",
+        "manager_source_revision",
+        "pinset_sha256",
+        "transaction_id",
+        "map",
+        "pinvi",
+    }
+    assert consumed_keys <= produced_keys, sorted(consumed_keys - produced_keys)
+
+    driver = _driver()
+    assert set(driver._LEAF_HASHED_ARTIFACTS) == {
+        "m04_attestation_sha256",
+        "m05_attestation_sha256",
+        "runtime_provenance_sha256",
+    }
