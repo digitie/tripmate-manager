@@ -3709,3 +3709,97 @@ def test_pair_v2_rejects_a_surface_that_differs_from_the_pinned_release(
         raised.value.diagnostic
         == "pair source blob digest differs from the pinned release"
     )
+
+
+def test_root_interrupt_is_not_swallowed_when_the_receipt_write_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """중단 신호는 receipt 기록이 실패해도 계속 전파돼야 한다.
+
+    `main`의 `except Exception`은 ordinary exception을 전부 잡으므로 `finally`까지
+    살아 오는 것은 BaseException뿐이고, 그것은 **일부러 안 잡은 신호**다("root
+    운영자가 중단 신호를 보낼 수 있게 둔다"). 종전 코드는 `finally` 안에서
+    `return 1`을 해 그 신호를 삼켰다 — 운영자가 Ctrl-C를 눌러도 하네스는 평범한
+    실패처럼 1로 끝났다. return을 `finally` 밖으로 빼야 이 테스트가 통과한다.
+    """
+
+    driver = _driver()
+    monkeypatch.setattr(
+        driver,
+        "_validate_trusted_release",
+        lambda _expected: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    real_write = driver._write_private_json
+
+    def _write(path: Path, payload: object) -> None:
+        if path.name == "result.json":
+            raise OSError("receipt write refused")
+        real_write(path, payload)
+
+    monkeypatch.setattr(driver, "_write_private_json", _write)
+
+    with pytest.raises(KeyboardInterrupt):
+        driver.main("a" * 40, tmp_path)
+
+
+def test_a_completed_body_without_a_receipt_is_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """본문이 통과해도 receipt를 남기지 못했으면 exit 0이 아니다.
+
+    이 규칙은 종전에 `finally` 안의 `return 1`이 우연히 지키고 있었다. return을
+    밖으로 빼면서 규칙이 사라질 수 있었으므로 `driver_exit_code`로 꺼내 네 조합을
+    전부 결박한다. 반환식에서 `receipt_write_failed`를 떨어뜨리면 첫 단언이
+    빨개진다 — 앞선 시도에서 이 축을 `completed=False` 경로로만 덮었더니 변이가
+    통과했다(공허한 게이트였다).
+    """
+
+    driver = _driver()
+
+    assert driver.driver_exit_code(completed=True, receipt_write_failed=True) == 1
+    assert driver.driver_exit_code(completed=True, receipt_write_failed=False) == 0
+    assert driver.driver_exit_code(completed=False, receipt_write_failed=True) == 1
+    assert driver.driver_exit_code(completed=False, receipt_write_failed=False) == 1
+
+
+def test_main_reports_the_receipt_write_failure_through_that_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`main`이 그 규칙을 실제로 거쳐 간다 — 규칙만 있고 안 부르면 소용없다."""
+
+    driver = _driver()
+    monkeypatch.setattr(
+        driver,
+        "_validate_trusted_release",
+        lambda _expected: (_ for _ in ()).throw(RuntimeError("discarded")),
+    )
+    monkeypatch.setattr(
+        driver, "_block_terminal_m05_execution", lambda *_a, **_k: None
+    )
+
+    seen: list[dict[str, bool]] = []
+    real_rule = driver.driver_exit_code
+
+    def _rule(*, completed: bool, receipt_write_failed: bool) -> int:
+        seen.append(
+            {"completed": completed, "receipt_write_failed": receipt_write_failed}
+        )
+        return real_rule(
+            completed=completed, receipt_write_failed=receipt_write_failed
+        )
+
+    monkeypatch.setattr(driver, "driver_exit_code", _rule)
+
+    real_write = driver._write_private_json
+
+    def _write(path: Path, payload: object) -> None:
+        if path.name == "result.json":
+            raise OSError("receipt write refused")
+        real_write(path, payload)
+
+    monkeypatch.setattr(driver, "_write_private_json", _write)
+
+    assert driver.main("a" * 40, tmp_path) == 1
+    assert seen == [{"completed": False, "receipt_write_failed": True}]
+    assert not (tmp_path / "result.json").exists()
