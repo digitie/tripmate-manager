@@ -729,6 +729,18 @@ def plan_standalone_restore(
 
 _REHEARSAL_DB_PREFIX = "ktdm_rehearsal_"
 _REHEARSAL_CONTAINER_DIR = "/tmp"
+
+#: 리허설의 createdb/pg_restore를 실행하는 컨테이너 안 유저.
+#:
+#: dump를 컨테이너로 넣은 뒤 **이 유저에게 소유권을 넘긴다.** 둘이 갈라지면
+#: `docker cp`가 host 소유권(root:root 0600)을 그대로 보존하므로 pg_restore가
+#: 자기가 복원할 파일을 읽지 못한다 — 2026-09-07 n150 실측:
+#:
+#:     pg_restore: error: could not open input file
+#:     "/tmp/rehearsal-....dump": Permission denied
+#:
+#: 모든 백업이 root 0600이므로 이 명령은 그전까지 한 번도 성공한 적이 없다.
+_REHEARSAL_EXEC_USER = "postgres"
 # 기본 timeout(4시간)보다 넉넉히 커야 "아직 진행 중인" 리허설을 실수로 지우지 않는다.
 _REHEARSAL_STALE_AFTER_SECONDS = 6 * 60 * 60
 # 복원된 크기가 백업 시점 크기의 이 비율에도 못 미치면 "일부만 복원됐을 수 있다"로 본다.
@@ -941,12 +953,31 @@ def rehearse_standalone_restore(
                 label=f"{role} rehearsal dump copy-in",
                 timeout=timeout,
             )
+            # `docker cp`는 host 파일의 소유권·권한을 그대로 보존한다. 백업은
+            # root:root 0600이고 pg_restore는 `_REHEARSAL_EXEC_USER`로 도므로,
+            # 소유권을 넘기지 않으면 자기가 복원할 파일을 읽지 못한다. 모드는
+            # 0600 그대로 두고 **소유자만** 바꾼다 — 읽을 수 있는 주체를 늘리지
+            # 않는다.
             _run_checked(
                 [
                     "docker",
                     "exec",
                     "--user",
-                    "postgres",
+                    "root",
+                    container_name,
+                    "chown",
+                    f"{_REHEARSAL_EXEC_USER}:{_REHEARSAL_EXEC_USER}",
+                    container_dump_path,
+                ],
+                label=f"{role} rehearsal dump ownership handover",
+                timeout=60,
+            )
+            _run_checked(
+                [
+                    "docker",
+                    "exec",
+                    "--user",
+                    _REHEARSAL_EXEC_USER,
                     container_name,
                     "createdb",
                     "--username",
@@ -965,7 +996,7 @@ def rehearse_standalone_restore(
                     "docker",
                     "exec",
                     "--user",
-                    "postgres",
+                    _REHEARSAL_EXEC_USER,
                     container_name,
                     "pg_restore",
                     "--username",
