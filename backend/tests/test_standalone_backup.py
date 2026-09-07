@@ -966,6 +966,11 @@ def test_restore_plan_turns_a_vanishing_dump_into_a_finding(
 # scratch DB는 성공/실패와 무관하게 항상 지워야 한다.
 
 
+#: 마지막 리허설이 실제로 낸 명령 순서. 순서 게이트가 읽는다 — 소유권 이양이
+#: copy-in 뒤·pg_restore 앞에 있어야 하고, 그 위치는 값이 아니라 **순서**다.
+REHEARSAL_COMMANDS: list[list[str]] = []
+
+
 def _rehearsal_probes(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -987,8 +992,13 @@ def _rehearsal_probes(
         standalone_backup, "_drop_stale_rehearsal_databases", lambda *a, **k: ()
     )
 
+    REHEARSAL_COMMANDS.clear()
+
     def run_checked(arguments: list[str], *, label: str, timeout: int) -> bytes:
+        REHEARSAL_COMMANDS.append(list(arguments))
         if arguments[:2] == ["docker", "cp"]:
+            return b""
+        if "chown" in arguments:
             return b""
         if "createdb" in arguments:
             return b""
@@ -998,6 +1008,7 @@ def _rehearsal_probes(
 
     def run_pg_restore(arguments: list[str], *, label: str, timeout: int) -> tuple[int, bytes]:
         assert "pg_restore" in arguments
+        REHEARSAL_COMMANDS.append(list(arguments))
         return pg_restore_returncode, pg_restore_stderr
 
     monkeypatch.setattr(standalone_backup, "_run_pg_restore", run_pg_restore)
@@ -1031,6 +1042,52 @@ def test_rehearse_standalone_restore_confirms_a_healthy_backup(
     # scratch DB는 항상 지운다 — dropdb가 실제로 호출됐는지 확인한다.
     assert any("dropdb" in call for call in cleanup_calls)
     assert any("rm" in call for call in cleanup_calls)
+
+
+def test_rehearse_restore_hands_the_dump_over_before_restoring_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """복원 전에 dump의 소유권을 복원 유저에게 넘긴다.
+
+    `docker cp`는 host 파일의 소유권·권한을 **그대로 보존한다.** 백업은 root:root
+    0600이고 pg_restore는 컨테이너 안 postgres(uid 999)로 도므로, 넘겨주지 않으면
+    자기가 복원할 파일을 읽지 못한다. 2026-09-07 n150 실측:
+
+        pg_restore: error: could not open input file
+        "/tmp/rehearsal-....dump": Permission denied
+
+    모든 백업이 root 0600이라 이 명령은 그전까지 한 번도 성공한 적이 없다 — 그래서
+    `T-VN-H49-{GEO-DAGSTER,CONCIERGE,PINVI}`의 마지막 조건이 닫히지 못하고 있었다.
+
+    결박하는 것은 **순서**다. chown이 copy-in 뒤·pg_restore 앞에 있지 않으면 아무
+    의미가 없다.
+    """
+    root = tmp_path / "geo"
+    root.mkdir()
+    _seed_backup(root, "geo", 1000, b"dump-bytes")
+    _rehearsal_probes(monkeypatch, restored_head="0001_head")
+
+    rehearse_standalone_restore("geo", backup_root=root)
+
+    kinds = [
+        "cp"
+        if command[:2] == ["docker", "cp"]
+        else next((token for token in ("chown", "createdb", "pg_restore") if token in command), "?")
+        for command in REHEARSAL_COMMANDS
+    ]
+    assert "cp" in kinds and "chown" in kinds and "pg_restore" in kinds, kinds
+    assert kinds.index("cp") < kinds.index("chown") < kinds.index("pg_restore"), kinds
+
+    chown = REHEARSAL_COMMANDS[kinds.index("chown")]
+    restore = REHEARSAL_COMMANDS[kinds.index("pg_restore")]
+    # chown 대상 경로 == pg_restore가 읽는 경로.
+    assert chown[-1] == restore[-1]
+    # 소유자는 복원을 실행하는 그 유저다 — 둘이 갈라지면 결박이 없는 것과 같다.
+    exec_user = standalone_backup._REHEARSAL_EXEC_USER
+    assert chown[-2] == f"{exec_user}:{exec_user}"
+    assert restore[restore.index("--user") + 1] == exec_user
+    # chown 자체는 root로 돈다 — 컨테이너 기본 유저로는 소유권을 넘길 수 없다.
+    assert chown[chown.index("--user") + 1] == "root"
 
 
 def test_rehearse_standalone_restore_skips_the_attempt_when_the_plan_is_blocked(
