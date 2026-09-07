@@ -112,11 +112,15 @@ _PINVI_RECONCILIATION_POLL_SECONDS = 1
 _PINVI_RECEIPT_READINESS_ATTEMPTS = 30
 # m04/m05 attestation이 검사·실행하는 Playwright runner의 핀 digest. body에서
 # 부재가 드러나면 무조건 소각이므로, 실행권 소비 전에 존재·버전 정합을 보장한다.
-# v1.62.1-noble — pinned PinVi source의 playwright-core와 driverVersion이 같아야
+# v1.63.0-noble — pinned PinVi source의 playwright-core와 driverVersion이 같아야
 # 브라우저 캐시(/ms-playwright)가 적중한다(적대 리뷰 실측: 구 digest v1.60.0은
 # chromium 1223만 실어 pinned 1.62.1의 1234 요구와 어긋났고, 본문 브라우저
 # 기동에서 무조건 소각될 운명이었다). 정합은 아래 claim 전 검사로 기계화한다.
-_PLAYWRIGHT_RUNNER_IMAGE = "mcr.microsoft.com/playwright@sha256:dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e"
+#
+# 2026-09-07: PinVi lockfile이 1.63.0으로 올라간 뒤 이 핀만 1.62.1에 남아 격리
+# e2e가 claim 전에 거부됐다. 그 거부가 **설계대로** 실행권 소비 전에 났다 —
+# 게이트가 없었다면 본문 브라우저 기동에서 한 사이클을 태웠을 것이다.
+_PLAYWRIGHT_RUNNER_IMAGE = "mcr.microsoft.com/playwright@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27"
 # Compose config은 trusted input이라도 외부 CLI 출력이다. JSON parser에 넘기는
 # 원문은 이 상한만 보관하고, 초과분도 끝까지 drain해 child pipe를 막지 않는다.
 _COMPOSE_CONFIG_OUTPUT_LIMIT = 256 * 1024
