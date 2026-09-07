@@ -3044,6 +3044,9 @@ def _verify_leaf_fixture(
     identity_in_history: bool,
     history_pinset: str | None = None,
     result_identity: str | None = None,
+    binding_manager: str | None = None,
+    result_manager: str | None = None,
+    attestation_manager: str | None = None,
 ):
     """`--verify-leaf`가 읽는 leaf 한 벌과 그에 맞는 registry 대역을 만든다."""
 
@@ -3067,7 +3070,7 @@ def _verify_leaf_fixture(
     attestation = {
         "payload": {
             "isolated_pinset_sha256": pinned.pinset_sha256,
-            "isolated_manager_source_revision": manager_revision,
+            "isolated_manager_source_revision": attestation_manager or manager_revision,
             "isolated_execution_identity_sha256": identity,
             "m04_server_side_chain_verified": True,
         },
@@ -3090,7 +3093,7 @@ def _verify_leaf_fixture(
                 "status": "passed",
                 "phase": "completed",
                 "pinset_sha256": pinned.pinset_sha256,
-                "manager_source_revision": manager_revision,
+                "manager_source_revision": result_manager or manager_revision,
                 "execution_identity_sha256": result_identity or identity,
                 "m04_attestation_sha256": m04_sha,
                 "m05_attestation_sha256": attestation_sha,
@@ -3101,19 +3104,26 @@ def _verify_leaf_fixture(
 
     class _Binding:
         def __init__(
-            self, execution_identity_sha256: str, *, pinset: str | None = None
+            self,
+            execution_identity_sha256: str,
+            *,
+            pinset: str | None = None,
+            manager: str | None = None,
         ) -> None:
             self.execution_identity_sha256 = execution_identity_sha256
             self.source_pinset_sha256 = pinset or pinned.pinset_sha256
             self.map_revision = map_revision
             self.pinvi_revision = pinvi_revision
+            self.manager_source_revision = manager or manager_revision
 
     class _Registry:
         # 검증 대상 leaf의 identity는 **history**에만 있고 current는 다른 값이다 —
         # Manager를 업그레이드한 뒤의 실제 상태가 정확히 이 모양이다.
         current = _Binding("d" * 64)
         history = (
-            (_Binding(identity, pinset=history_pinset),) if identity_in_history else ()
+            (_Binding(identity, pinset=history_pinset, manager=binding_manager),)
+            if identity_in_history
+            else ()
         )
 
         @staticmethod
@@ -3168,6 +3178,70 @@ def test_verify_leaf_refuses_an_identity_bound_to_no_pinned_pair(
 
     assert driver.verify_leaf(leaf) == 1
     assert "L5 execution identity" in capsys.readouterr().out
+
+
+def test_verify_leaf_accepts_a_leaf_built_by_an_older_manager_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Manager를 업그레이드해도 그 이전 leaf가 검증 가능해야 한다.
+
+    L4를 **설치된** revision과 대조하면 L5와 똑같은 이유로 깨진다 — 이 검증기를
+    배포하는 순간 설치 revision이 바뀌어 자기 배포 이전 leaf를 영원히 못 본다.
+    2026-09-07 n150에서 실제로 그렇게 거부됐다(L5는 고쳤는데 L4가 같은 결함을 그대로
+    들고 있었다). 정본은 그 leaf가 결박된 **registry binding**이다.
+    """
+    driver = _driver()
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True
+    )
+    # 설치된 Manager는 leaf가 만들어진 뒤 업그레이드됐다.
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: "9" * 40)
+
+    assert driver.verify_leaf(leaf) == 0
+    out = capsys.readouterr().out
+    assert "leaf verification PASSED" in out
+    assert "is_installed=False" in out
+
+
+def test_verify_leaf_refuses_attestation_and_result_manager_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """attestation과 `result.json`이 서로 다른 Manager revision을 말하면 거부한다.
+
+    leaf 안에서 두 문서가 갈라지는 것은 그 자체로 증적이 아니다 — L5의 identity
+    축과 같은 이유다.
+    """
+    driver = _driver()
+    # result·binding은 서로 맞고 **attestation만** 어긋나게 둔다. 그래야 이 게이트가
+    # "attestation도 본다"는 사실 하나만 겨냥한다 — result만 어긋내면 binding 대조가
+    # 대신 잡아서 게이트가 공허해진다(변이 검증에서 실제로 그랬다).
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, attestation_manager="7" * 40
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "L4 Manager source revision" in capsys.readouterr().out
+
+
+def test_verify_leaf_refuses_manager_revision_that_the_binding_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """leaf가 주장하는 Manager revision이 그 binding의 것과 다르면 거부한다."""
+    driver = _driver()
+    leaf, manager_revision, registry, pins = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, binding_manager="a" * 40
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "trusted_manager_source_revision", lambda: manager_revision)
+
+    assert driver.verify_leaf(leaf) == 1
+    assert "L4 Manager source revision" in capsys.readouterr().out
 
 
 def test_verify_leaf_refuses_history_bound_to_another_pinset(
