@@ -1039,6 +1039,9 @@ def rehearse_standalone_restore(
                 restored_db_size_bytes = _query_db_size(
                     container_name, port, admin_name, scratch_database
                 )
+                restored_alembic_head_hint = _discover_alembic_head(
+                    container_name, port, admin_name, scratch_database
+                )
                 # **소유권·ACL이 살아남았는가.** 지금까지 리허설은 "pg_restore가
                 # exit 0이고 head·크기가 말이 된다"까지만 봤다 — 그것은 행이
                 # 들어갔다를 뜻하지, SECURITY DEFINER 소유자와 relation ACL이
@@ -1060,12 +1063,31 @@ def rehearse_standalone_restore(
                         )
                     )
                 elif restored_catalog_digest != live_catalog_digest:
+                    # **두 경우를 구별해 준다.** schema revision이 다르면 카탈로그가
+                    # 다른 것이 당연하다 — 그 백업이 지금보다 앞선 세대라는 뜻이고,
+                    # 그것 자체가 유용한 정보다. 같은 revision인데도 다르면 그때가
+                    # 들여다볼 자리다(마이그레이션 밖에서 카탈로그를 바꾸는 것이
+                    # 있거나, 복원이 소유권을 잃은 것이다).
+                    same_revision = (
+                        plan.manifest.alembic_head is not None
+                        and restored_alembic_head_hint is not None
+                        and plan.manifest.alembic_head == restored_alembic_head_hint
+                    )
                     findings.append(
                         RestorePlanFinding(
                             "REHEARSAL_CATALOG_DRIFT",
-                            "복원된 DB의 소유권·ACL·routine 보안 속성이 현재 DB와 "
-                            "다릅니다. 행은 들어갔더라도 그 상태로는 런타임이 "
-                            "자기 표를 읽지 못할 수 있습니다.",
+                            (
+                                "복원된 DB의 소유권·ACL·routine 보안 속성이 현재 DB와 "
+                                "다릅니다. schema revision은 같으므로 마이그레이션 밖에서 "
+                                "카탈로그를 바꾸는 것이 있거나 복원이 소유권을 잃은 "
+                                "것입니다 — 들여다볼 자리입니다."
+                            )
+                            if same_revision
+                            else (
+                                "복원된 DB의 카탈로그가 현재 DB와 다릅니다. 백업의 "
+                                "schema revision이 현재와 달라 예상된 차이입니다 — "
+                                "이 백업은 지금보다 앞선 세대입니다."
+                            ),
                             False,
                         )
                     )
