@@ -4800,6 +4800,27 @@ def test_a_failed_consume_record_leaves_a_durable_marker(
     assert "still be runnable" in payload["consequence"]
 
 
+def test_the_consume_failure_path_writes_the_marker_not_a_print() -> None:
+    """marker **호출부**를 결박한다.
+
+    앞 테스트는 `_write_consume_failure_marker`를 직접 부르므로, 호출부를 print로
+    되돌려도 초록이다(변이 검증이 그것을 드러냈다). 배선을 따로 잰다 — 이 파일이
+    소비 배선에 쓴 방식과 같다.
+    """
+
+    source = (
+        Path(__file__).resolve().parents[2] / "scripts/m05_isolated_e2e.py"
+    ).read_text(encoding="utf-8")
+
+    guard = source.index("if not execution_consumed:")
+    end_of_block = source.index("for name in _RAW_ENV_NAMES:", guard)
+    block = source[guard:end_of_block]
+
+    assert "_write_consume_failure_marker(" in block
+    # print는 운영에서 `/dev/null`로 간다 — 이 경로의 보고 수단이 될 수 없다.
+    assert "print(" not in block
+
+
 def test_the_launcher_discards_driver_stdout_so_prints_are_not_a_channel() -> None:
     """위 두 테스트의 **전제**를 고정한다.
 
