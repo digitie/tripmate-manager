@@ -372,6 +372,7 @@ PHASES = frozenset(
     {
         "arguments_invalid", "runtime_command_output_too_large",
         "admission", "source_materialization", "ledger_claim", "runtime_setup",
+        "execution_identity_consumed",
         "map_runtime", "map_postgres_start_failed", "map_fresh_init_failed",
         "map_application_start_failed", "map_health_status_failed",
         "map_health_transport_failed", "map_subscription",
@@ -413,6 +414,7 @@ PREFLIGHT_REJECTED_PHASES = frozenset(
         "admission",
         "arguments_invalid",
         "driver_contract_failed",
+        "execution_identity_consumed",
         "network_inspect_invalid",
         "network_subnet_unavailable",
         "pair_contract_invalid",

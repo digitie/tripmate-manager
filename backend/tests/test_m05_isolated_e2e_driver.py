@@ -18,12 +18,14 @@ from urllib.request import Request
 
 import pytest
 
+from kor_travel_docker_manager.services import runtime_pin_registry as pin_registry
 from kor_travel_docker_manager.services.pinned_runtime_release import (
     current_pinned_runtime_release,
 )
 from kor_travel_docker_manager.services.runtime_execution_registry import (
     BlockedExecution,
     ExecutionIdentityV6,
+    migrate_execution_registry,
 )
 
 PINNED_RUNTIME_RELEASE = current_pinned_runtime_release()
@@ -4410,3 +4412,426 @@ def test_the_provenance_producer_and_the_verifier_agree_on_the_bound_keys() -> N
         "m05_attestation_sha256",
         "runtime_provenance_sha256",
     }
+
+
+# ---------------------------------------------------------------------------
+# T-VN-M05-VERIFY-RECEIPT — 검증이 durable 기록을 남긴다
+# ---------------------------------------------------------------------------
+
+
+def _receipts(driver: ModuleType) -> list[Path]:
+    root = driver._LEDGER.parent / driver._VERIFY_RECEIPT_DIRNAME
+    return sorted(root.glob("*.json")) if root.exists() else []
+
+
+def _verify_leaf_patched(
+    driver: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **kwargs: object
+):
+    leaf, manager_revision, registry, pins, ledger = _verify_leaf_fixture(
+        tmp_path, driver, identity_in_history=True, **kwargs
+    )
+    monkeypatch.setattr(driver, "_LEDGER", ledger)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(
+        driver, "trusted_manager_source_revision", lambda: manager_revision
+    )
+    return leaf, manager_revision, ledger
+
+
+def test_verify_leaf_writes_a_root_owned_receipt_for_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """통과 근거가 출력 텍스트로만 남으면 재현이 불가능해진다.
+
+    pin 회전·history 500칸 링·identity 소각 중 무엇이 먼저 와도 `--verify-leaf`를 다시
+    돌려 같은 결론을 얻을 수 없다. 그래서 조문이 durable receipt를 요구한다(V1).
+    """
+
+    driver = _driver()
+    leaf, _manager_revision, _ledger = _verify_leaf_patched(driver, monkeypatch, tmp_path)
+
+    assert driver.verify_leaf(leaf) == 0
+
+    written = _receipts(driver)
+    assert len(written) == 1
+    assert oct(written[0].stat().st_mode & 0o777) == "0o600"
+    assert oct(written[0].parent.stat().st_mode & 0o777) == "0o700"
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+
+    assert payload["outcome"] == "passed"
+    assert payload["coverage"] == "complete"
+    assert payload["failed_axes"] == []
+
+    # **축을 여기서 다시 열거하지 않는다.** 인쇄된 줄과 같아야 한다 — 그래야 축이 늘 때
+    # receipt도 함께 늘고, 두 곳에 적힌 숫자가 갈리지 않는다(조문 V1의 요구).
+    printed = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith(("PASS ", "FAIL "))
+    ]
+    assert payload["axis_count"] == len(printed)
+    assert [axis["name"] for axis in payload["axes"]] == [
+        line.split(" — ")[0][5:] for line in printed
+    ]
+
+
+def test_the_receipt_carries_what_it_compared_against(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V2 — pin이 움직여 재현이 불가능해져도 **무엇과 대조했는지**는 남는다."""
+
+    driver = _driver()
+    leaf, manager_revision, ledger = _verify_leaf_patched(driver, monkeypatch, tmp_path)
+
+    assert driver.verify_leaf(leaf) == 0
+    payload = json.loads(_receipts(driver)[0].read_text(encoding="utf-8"))
+
+    assert (
+        payload["pinned_pair"]["pinset_sha256"]
+        == driver.PINNED_RUNTIME_RELEASE.pinset_sha256
+    )
+    assert payload["pinned_pair"]["map_source_revision"]
+    assert payload["pinned_pair"]["pinvi_source_revision"]
+    assert payload["leaf_binding"]["binding_found"] is True
+    assert payload["leaf_binding"]["binding_manager_source_revision"] == manager_revision
+    assert payload["ledger_claim_name"]
+    assert payload["registry_paths"]["ledger"] == str(ledger)
+    # 검증기 자신도 식별돼야 한다 — 설치본과 브랜치 체크아웃이 갈릴 수 있고, 4차 리뷰가
+    # 정확히 그 갈림으로 잘못된 측정을 잡았다.
+    assert payload["verifier"]["verifier_script_sha256"]
+    assert payload["verifier"]["installed_manager_source_revision"] == manager_revision
+
+
+def test_a_rejected_leaf_still_leaves_a_receipt_with_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**실패도 남긴다.** 통과만 남기면 "검증한 적 없다"와 "떨어졌다"가 같아 보인다.
+
+    가장 필요한 실패 종류가 신뢰 경계 거부다 — 종전에는 그 경로가 한 문장만 인쇄하고
+    축을 하나도 남기지 않아, receipt를 붙였어도 내용이 비었을 것이다.
+    """
+
+    driver = _driver()
+    leaf, _manager_revision, _ledger = _verify_leaf_patched(driver, monkeypatch, tmp_path)
+
+    leaf.chmod(0o755)
+    assert driver.verify_leaf(leaf) == 1
+    leaf.chmod(0o700)
+
+    written = _receipts(driver)
+    assert len(written) == 1
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+    assert payload["outcome"] == "failed"
+    assert payload["coverage"] == "rejected_at_trust_boundary"
+    assert payload["failed_axes"] == ["L0 leaf 신뢰 경계"]
+    assert "trusted root-owned artifact" in payload["axes"][0]["detail"]
+
+
+def test_a_receipt_write_failure_does_not_flip_the_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """V4 — receipt는 근거의 기록이지 **통과 조건이 아니다.**
+
+    그렇다고 조용히 넘어가서도 안 된다. 둘 다 잰다.
+    """
+
+    driver = _driver()
+    leaf, _manager_revision, _ledger = _verify_leaf_patched(driver, monkeypatch, tmp_path)
+
+    real_open = driver.os.open
+
+    def _refuse(path, flags, *args, **kwargs):
+        if driver._VERIFY_RECEIPT_DIRNAME in str(path):
+            raise OSError("read-only filesystem")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(driver.os, "open", _refuse)
+    assert driver.verify_leaf(leaf) == 0
+    assert "verify receipt was not written" in capsys.readouterr().out
+    assert _receipts(driver) == []
+
+
+# ---------------------------------------------------------------------------
+# T-VN-M05-ONESHOT-CONSUME — 성공이 execution identity를 소비한다
+# ---------------------------------------------------------------------------
+
+
+def _consumed_registry(driver: ModuleType):
+    """**실제** registry로 소비 기록을 만든다.
+
+    duck-type 스텁을 쓰면 `has_block_for_current`의 진짜 술어를 재지 못하고, 그러면
+    phase 필터를 지우는 변이가 원리적으로 RED가 되지 않는다 — 3차 적대 리뷰 P0가 정확히
+    그 구멍으로 들어왔다.
+    """
+
+    pinned = driver.PINNED_RUNTIME_RELEASE
+    pins = pin_registry.build_registry(
+        release_version=5,
+        map_revision=pinned.source_for("map").revision,
+        pinvi_revision=pinned.source_for("pinvi").revision,
+        rotated_by="tester",
+        reason="seed",
+    )
+    registry = migrate_execution_registry(
+        pins=pins,
+        manager_source_revision=_CONSUME_MANAGER_REVISION,
+        bound_by="tester",
+        reason="migrate",
+    )
+    return pins, registry
+
+
+_CONSUME_MANAGER_REVISION = "e" * 40
+
+
+def test_a_consumed_identity_cannot_run_the_body_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """성공한 identity로 acceptance 본문을 두 번 돌 수 없어야 한다.
+
+    종전에는 성공 분기가 registry를 아예 건드리지 않아 같은 identity가 계속 runnable
+    이었다(2026-09-07 실측). one-shot이 **실패에만** 걸려 있었다.
+    """
+
+    driver = _driver()
+    pins, registry = _consumed_registry(driver)
+
+    # 소비 전에는 돈다 — 이 축이 없으면 아래 거부가 "원래 안 되던 것"과 구별되지 않는다.
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    driver._assert_current_m05_execution_is_runnable(_CONSUME_MANAGER_REVISION)
+
+    consumed = driver.block_current_execution(
+        registry=registry,
+        reason="acceptance consumed",
+        phase=driver._CONSUMED_EXECUTION_PHASE,
+    )
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: consumed)
+    with pytest.raises(driver._PhaseError, match=driver._CONSUMED_EXECUTION_PHASE):
+        driver._assert_current_m05_execution_is_runnable(_CONSUME_MANAGER_REVISION)
+
+
+def test_a_consumed_leaf_still_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """소비된 leaf가 계속 검증돼야 한다 — 조문 3항의 요지다.
+
+    이 축이 없으면 소비를 `phase=None`으로 바꿔도 나머지가 전부 초록이다.
+    """
+
+    driver = _driver()
+    leaf, _manager_revision, _ledger = _verify_leaf_patched(
+        driver,
+        monkeypatch,
+        tmp_path,
+        blocked_phases=(driver._CONSUMED_EXECUTION_PHASE,),
+    )
+
+    assert driver.verify_leaf(leaf) == 0
+
+
+def test_the_consume_phase_is_mirrored_in_both_vocabularies() -> None:
+    """어휘가 갈리면 소비 기록이 `driver_contract_failed`로 둔갑한다.
+
+    그리고 pre-claim 집합에서 빠지면, 소비 거부로 끝난 실행(아무것도 claim하지 않았다)이
+    launcher에서 무조건 소각으로 승격된다.
+    """
+
+    driver = _driver()
+    phase = driver._CONSUMED_EXECUTION_PHASE
+    assert driver._public_terminal_phase(phase) == phase
+    assert driver._terminal_block_phase(phase) == phase
+    assert phase in driver._PRE_CLAIM_PHASES
+    launcher = (
+        Path(__file__).resolve().parents[2] / "scripts/run-m05-isolated-e2e-once"
+    ).read_text(encoding="utf-8")
+    assert launcher.count(f'"{phase}"') == 2
+
+
+def test_consume_records_the_scoped_phase_not_a_burn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """소비가 **어떤 기록으로** 남는지를 직접 잰다.
+
+    `finally` 안에 인라인으로 두면 이 축을 잴 수 없다 — 그래서 규칙을 이름 있는 함수로
+    꺼냈다(`driver_exit_code`와 같은 이유이자, 이 파일이 이미 한 번 겪은 공허한 게이트).
+    """
+
+    driver = _driver()
+    pins, registry = _consumed_registry(driver)
+    written: list[object] = []
+
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: registry)
+    monkeypatch.setattr(
+        driver, "write_runtime_execution_registry", lambda updated: written.append(updated)
+    )
+
+    assert (
+        driver.consume_current_m05_execution(
+            expected_manager_revision=_CONSUME_MANAGER_REVISION
+        )
+        is True
+    )
+    assert len(written) == 1
+    updated = written[0]
+    # **소각이 아니어야 한다.** 소각이면 방금 성공한 leaf가 L8에서 죽는다.
+    assert updated.is_unconditionally_blocked_current() is False
+    assert [entry.phase for entry in updated.blocked_executions] == [
+        driver._CONSUMED_EXECUTION_PHASE
+    ]
+
+
+def test_main_consumes_the_execution_only_on_the_success_branch() -> None:
+    """성공 분기가 실제로 소비를 부르는지 **결박**한다.
+
+    `main`의 `finally`를 통째로 도는 테스트는 acceptance 본문 전체를 흉내 내야 해서
+    현실적이지 않다. 그래서 이 파일이 이미 쓰는 방식대로(`gate = source.index(...)`)
+    호출이 **어느 분기 안에** 있는지를 소스로 확인한다. 잰다고 주장하는 것은 배선뿐이고,
+    무엇이 기록되는지는 위 테스트가 실제로 잰다.
+    """
+
+    source = (
+        Path(__file__).resolve().parents[2] / "scripts/m05_isolated_e2e.py"
+    ).read_text(encoding="utf-8")
+
+    failure_branch = source.index("if not completed and claim_attempted:")
+    success_branch = source.index("elif completed and claim_attempted:", failure_branch)
+    consume_call = source.index(
+        "consume_current_m05_execution(", success_branch
+    )
+    end_of_finally = source.index('for name in _RAW_ENV_NAMES:', success_branch)
+
+    # 성공 분기 **안에** 있어야 한다.
+    assert success_branch < consume_call < end_of_finally
+    # 실패 분기에서는 부르지 않는다 — 실패는 소각이지 소비가 아니다.
+    assert "consume_current_m05_execution(" not in source[failure_branch:success_branch]
+
+
+def test_a_scoped_infra_block_does_not_look_like_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**소비 검사가 다른 scoped 기록까지 삼키면 안 된다.**
+
+    적대 리뷰가 잡은 구멍이다. `has_block_for_current(phase=...)`에서 `phase=`를 떼면
+    그 술어는 **모든** 차단 기록을 잡는다(registry:254-264) — 인프라 phase로 scoped
+    기록이 남은 identity가 그때부터 영구히 거부되고, 진단은 엉뚱하게
+    `execution_identity_consumed`가 된다. 그것이 #330이 넣고 #331이 되돌린 회귀와
+    같은 부류다.
+
+    앞선 테스트들은 이 축을 **가려 준다** — 깨끗한 registry(기록 0건)와 소비된
+    registry(소비 기록 1건)만 보여 주는데, 둘 다 `phase=` 유무로 답이 갈리지 않는다.
+    갈리는 유일한 상태가 여기 있다: **소비가 아닌 scoped 기록 하나.**
+    """
+
+    driver = _driver()
+    pins, registry = _consumed_registry(driver)
+    infra_blocked = driver.block_current_execution(
+        registry=registry,
+        reason="infra phase failed",
+        phase="runtime_setup_network",
+    )
+    assert infra_blocked.is_unconditionally_blocked_current() is False
+    assert infra_blocked.has_block_for_current(phase="runtime_setup_network") is True
+
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: infra_blocked)
+
+    # 보정 후 재실행이 가능해야 한다 — phase-scoped 설계의 요지다.
+    driver._assert_current_m05_execution_is_runnable(_CONSUME_MANAGER_REVISION)
+
+
+def test_the_consumed_rejection_names_the_recovery_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """조문 2항 — 진단이 무엇을 해야 하는지 말한다.
+
+    phase 이름만 내면 운영자는 "이 실행을 되살릴 수 있나"를 알 수 없다. 되살릴 수 없고
+    새 identity가 필요하다는 것이 답이며, 그것을 말해야 한다.
+    """
+
+    driver = _driver()
+    pins, registry = _consumed_registry(driver)
+    consumed = driver.block_current_execution(
+        registry=registry,
+        reason="acceptance consumed",
+        phase=driver._CONSUMED_EXECUTION_PHASE,
+    )
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: consumed)
+
+    with pytest.raises(driver._PhaseError) as refused:
+        driver._assert_current_m05_execution_is_runnable(_CONSUME_MANAGER_REVISION)
+
+    diagnostic = refused.value.diagnostic
+    assert diagnostic == driver._CONSUMED_DIAGNOSTIC
+    assert "rotate or rebind" in diagnostic
+    # 닫힌 어휘에 있어야 preflight가 실제로 내보인다 — 없으면 조용히 삼켜진다.
+    # `_PAIR_DIAGNOSTICS`가 아니라 상위 집합이다: 그쪽은 pair 실패 전용이고,
+    # 그 안의 모든 문자열이 발신된다는 것을 별도 테스트가 양방향으로 결박한다.
+    assert diagnostic in driver._SAFE_DIAGNOSTICS
+    assert diagnostic not in driver._PAIR_DIAGNOSTICS
+
+
+def test_a_failed_consume_record_leaves_a_durable_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """소비 기록 실패를 print로 말하면 운영에서는 **아무 데도 닿지 않는다.**
+
+    launcher가 드라이버를 `>/dev/null 2>&1`로 부른다(run-m05-isolated-e2e-once). 그러면
+    "소비됐다"와 "기록에 실패했다"가 같아 보이고, 그 identity가 실제로는 재실행 가능한
+    채로 남는다. receipt와 같은 방식으로 durable하게 남긴다.
+    """
+
+    driver = _driver()
+    monkeypatch.setattr(driver, "_LEDGER", tmp_path / "ledger")
+
+    driver._write_consume_failure_marker("f" * 40, "a" * 64)
+
+    root = (tmp_path / "ledger").parent / driver._CONSUME_FAILURE_DIRNAME
+    written = sorted(root.glob("*.json"))
+    assert len(written) == 1
+    assert oct(written[0].stat().st_mode & 0o777) == "0o600"
+    assert oct(root.stat().st_mode & 0o777) == "0o700"
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+    assert payload["execution_identity_sha256"] == "a" * 64
+    assert payload["manager_source_revision"] == "f" * 40
+    assert "still be runnable" in payload["consequence"]
+
+
+def test_the_consume_failure_path_writes_the_marker_not_a_print() -> None:
+    """marker **호출부**를 결박한다.
+
+    앞 테스트는 `_write_consume_failure_marker`를 직접 부르므로, 호출부를 print로
+    되돌려도 초록이다(변이 검증이 그것을 드러냈다). 배선을 따로 잰다 — 이 파일이
+    소비 배선에 쓴 방식과 같다.
+    """
+
+    source = (
+        Path(__file__).resolve().parents[2] / "scripts/m05_isolated_e2e.py"
+    ).read_text(encoding="utf-8")
+
+    guard = source.index("if not execution_consumed:")
+    end_of_block = source.index("for name in _RAW_ENV_NAMES:", guard)
+    block = source[guard:end_of_block]
+
+    assert "_write_consume_failure_marker(" in block
+    # print는 운영에서 `/dev/null`로 간다 — 이 경로의 보고 수단이 될 수 없다.
+    assert "print(" not in block
+
+
+def test_the_launcher_discards_driver_stdout_so_prints_are_not_a_channel() -> None:
+    """위 두 테스트의 **전제**를 고정한다.
+
+    launcher가 언젠가 stdout을 보존하게 바뀌면 durable marker가 과잉일 수 있다. 반대로
+    지금 상태에서 print로 되돌리면 보고가 사라진다. 어느 쪽이든 이 전제가 바뀌면
+    알아야 하므로 여기서 잰다.
+    """
+
+    launcher = (
+        Path(__file__).resolve().parents[2] / "scripts/run-m05-isolated-e2e-once"
+    ).read_text(encoding="utf-8")
+    invocation = launcher.index("m05_isolated_e2e.py")
+    tail = launcher[invocation : launcher.index("driver_status=", invocation)]
+    assert ">/dev/null 2>&1" in tail

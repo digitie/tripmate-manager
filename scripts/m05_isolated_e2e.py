@@ -23,6 +23,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, NoReturn
@@ -79,12 +80,14 @@ from kor_travel_docker_manager.services.runtime_execution_registry import (
     RuntimeExecutionRegistryError,
     block_current_execution,
     load_runtime_execution_registry,
+    runtime_execution_registry_path,
     trusted_manager_source_revision,
     write_runtime_execution_registry,
 )
 from kor_travel_docker_manager.services.runtime_pin_registry import (
     RuntimePinRegistryError,
     load_runtime_pin_registry,
+    runtime_pin_registry_path,
 )
 
 # pinned revision은 코드 상수가 아니라 root 소유 registry가 소유한다(ADR-40).
@@ -198,6 +201,9 @@ _PUBLIC_TERMINAL_PHASES = frozenset(
         "runtime_command_output_too_large",
         "admission",
         "driver_contract_failed",
+        # 성공이 실행권을 소비했다는 scoped 기록. 이 어휘에 없으면
+        # `_public_terminal_phase`가 `driver_contract_failed`로 바꿔 엉뚱한 기록이 남는다.
+        "execution_identity_consumed",
         "ledger_claim",
         "m04_fixture_http_failed",
         "m04_fixture_invalid",
@@ -338,6 +344,14 @@ def _assert_current_m05_execution_is_runnable(
         _fail("runtime_execution_registry_changed")
     if execution.is_unconditionally_blocked_current():
         _fail("terminal_execution_blocked")
+    if execution.has_block_for_current(phase=_CONSUMED_EXECUTION_PHASE):
+        # 이미 acceptance 본문을 완주한 identity다. 같은 identity로 본문을 두 번 돌면
+        # "실행은 단 한 번"이 깨진다.
+        #
+        # **복구 경로를 말한다.** phase 이름만 내면 운영자가 다음 행동을 못 정한다 —
+        # 이 실행은 되살릴 수 없고, 새 execution identity를 만들어야 한다.
+        # `_fail`의 진단은 고정 어휘라 호스트 상태·비밀을 담지 않는다.
+        _fail(_CONSUMED_EXECUTION_PHASE, diagnostic=_CONSUMED_DIAGNOSTIC)
     return execution
 
 
@@ -359,6 +373,20 @@ def _public_terminal_phase(phase: str) -> str:
 #: 0건 — 인프라 실패가 acceptance 실패와 같은 형벌(3-repo 회전)을 받아 후보 예산이
 #: 본문 도달 전에 소진됐다(`ktm-m03 docs/reports/map-stall-root-cause-2026-08-31.md` §3 I-1).
 _UNCONDITIONAL_TERMINAL_PHASES = frozenset({"ledger_claim", "m04_m05_e2e"})
+
+#: acceptance 본문을 **성공적으로 마친** execution identity에 남기는 scoped 기록.
+#:
+#: 소각(`phase=None`)과 **다른 것**이어야 한다. 소각으로 남기면 방금 성공한 leaf가
+#: `--verify-leaf` L8에서 실패한다 — L8은 `entry.phase is None`인 기록만 보고
+#: 그것이 곧 "이 identity는 태워졌다"이기 때문이다. 승격 증거가 스스로를 무효화하는
+#: 셈이라 one-shot을 성공에도 걸 수 없었다(`T-VN-M05-ONESHOT-CONSUME`).
+#:
+#: scoped phase로 남기면 셋이 동시에 성립한다:
+#: - `is_unconditionally_blocked_current()`가 이것을 소각으로 세지 않는다(배포·회전이
+#:   막히지 않는다 — 소비는 "승격됐다"이지 "오염됐다"가 아니다).
+#: - L8이 보지 않으므로 통과한 leaf가 계속 검증된다.
+#: - `_assert_current_m05_execution_is_runnable`이 이것만 따로 보고 재실행을 막는다.
+_CONSUMED_EXECUTION_PHASE = "execution_identity_consumed"
 
 # ledger claim **이전**에만 도달할 수 있는 phase 집합 — claim 이후에만 나오는
 # phase를 넣으면 "실행권을 소비하지 않았다"고 주장하는 receipt가 소비를 증명하는
@@ -402,10 +430,88 @@ _PRE_CLAIM_PHASES = frozenset(
         "runtime_setup_workspace",
         "source_materialization",
         "terminal_execution_blocked",
+        # 소비 거부는 runnable assert에서 나오므로 claim **이전**이다. 이 실행은
+        # 아무것도 claim하지 않았고 실행권도 쓰지 않았다.
+        #
+        # 상수가 아니라 **리터럴**로 적는다 — launcher 미러를 결박하는 테스트가 이
+        # 집합을 소스 텍스트로 읽으므로, 이름으로 적으면 그 결박이 조용히 비어 버린다.
+        # 상수와 갈리지 않는 것은 아래 어휘 결박 단언이 지킨다.
+        "execution_identity_consumed",
         "trusted_release_invalid",
         "trusted_release_revision_mismatch",
     }
 )
+
+
+# 상수와 두 어휘가 갈리면 소비 기록이 `driver_contract_failed`로 둔갑하거나(공개 어휘
+# 누락) 소비 거부가 claim 소비로 오독된다(pre-claim 누락). 리터럴로 적는 대가를 여기서
+# 갚는다 — import 시점에 터진다.
+assert _CONSUMED_EXECUTION_PHASE in _PUBLIC_TERMINAL_PHASES
+assert _CONSUMED_EXECUTION_PHASE in _PRE_CLAIM_PHASES
+assert _CONSUMED_EXECUTION_PHASE not in _UNCONDITIONAL_TERMINAL_PHASES
+
+
+#: 소비 기록 실패의 durable marker가 사는 곳. receipt와 같은 뿌리를 쓴다.
+_CONSUME_FAILURE_DIRNAME = "m05-consume-failures"
+
+
+def _write_consume_failure_marker(
+    expected_manager_revision: str, execution_identity: str | None
+) -> None:
+    """소비 기록이 실패했다는 사실을 root-owned 0600 파일로 남긴다.
+
+    운영 경로에서 launcher가 드라이버 stdout을 버리므로 print로는 이 사실이 아무 데도
+    닿지 않는다. 그러면 "소비됐다"와 "기록에 실패했다"가 같아 보이고, 그 identity가
+    실제로는 재실행 가능한 채로 남는다.
+
+    **실패해도 실행을 실패로 만들지 않는다.** 통과한 1~2시간 실행을 부기 실패로 뒤집는
+    것이 두 번 돌 수 있는 것보다 나쁘다.
+    """
+
+    root = _LEDGER.parent / _CONSUME_FAILURE_DIRNAME
+    payload = {
+        "schema_version": 1,
+        "observed_at": datetime.now(UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        "manager_source_revision": expected_manager_revision,
+        "execution_identity_sha256": execution_identity,
+        "consequence": "this execution identity may still be runnable",
+    }
+    raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + chr(10)).encode()
+    stamp = str(payload["observed_at"]).replace(":", "").replace("-", "").replace(".", "")
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(
+            root / f"{stamp}.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(fd, raw)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # 여기까지 실패하면 남길 채널이 없다. 실행 판정을 뒤집지는 않는다.
+        pass
+
+
+def consume_current_m05_execution(*, expected_manager_revision: str) -> bool:
+    """acceptance 본문을 마친 execution identity를 **소비 기록**으로 닫는다.
+
+    `finally` 안에 인라인으로 두지 않고 꺼내는 이유는 `driver_exit_code`와 같다 —
+    거기 묻힌 규칙은 직접 잴 수 없어서 그 축의 게이트가 공허해진다(이 파일이 이미 한 번
+    겪었다: "앞선 시도에서 이 축을 completed=False 경로로만 덮었더니 변이가 통과했다").
+
+    **소각이 아니라 scoped 기록이다.** 소각으로 남기면 방금 성공한 leaf가 L8에서
+    실패한다 — 승격 증거가 스스로를 무효화한다.
+    """
+
+    return _block_terminal_m05_execution(
+        _CONSUMED_EXECUTION_PHASE,
+        expected_manager_revision=expected_manager_revision,
+    )
 
 
 def _terminal_block_phase(public_phase: str) -> str | None:
@@ -1760,6 +1866,13 @@ def _canonical_json(value: object) -> bytes:
 #: 않고 접두로 거르므로, 새 문구가 생겨도 이 상수가 뒤처지지 않는다.
 _SOURCE_DIAGNOSTIC_PREFIX = "pinned runtime source "
 
+#: 소비된 identity로 다시 부를 때 내는 고정 진단. 값이 이 파일의 상수라 호스트 상태나
+#: 비밀이 섞일 수 없다 — 어휘 규약(위 주석) 그대로다.
+_CONSUMED_DIAGNOSTIC = (
+    "execution identity already consumed by a completed acceptance run;"
+    " rotate or rebind the runtime pair to obtain a new identity"
+)
+
 _PAIR_DIAGNOSTICS: frozenset[str] = frozenset(
     {
         "pair contract is unreadable",
@@ -1781,6 +1894,13 @@ _PAIR_DIAGNOSTICS: frozenset[str] = frozenset(
         "derived application head differs from the committed generation",
     }
 )
+
+#: preflight가 stdout으로 **내보내도 되는** 진단 전체.
+#:
+#: `_PAIR_DIAGNOSTICS`에 소비 진단을 섞지 않는다 — 그 집합은 이름 그대로 pair 실패
+#: 어휘이고, "그 안의 모든 문자열이 실제로 발신된다"를 기존 테스트가 양방향으로
+#: 결박한다. 다른 phase의 진단을 넣으면 그 결박이 거짓이 된다.
+_SAFE_DIAGNOSTICS: frozenset[str] = _PAIR_DIAGNOSTICS | frozenset({_CONSUMED_DIAGNOSTIC})
 
 
 def _sha256_text(value: object) -> str:
@@ -2385,17 +2505,126 @@ def _leaf_object(value: object, *, name: str) -> dict[str, object]:
     return value
 
 
-def _report(checks: list[tuple[str, bool, str]]) -> int:
-    """잰 축을 전부 인쇄하고 종료코드를 낸다.
+#: receipt가 사는 곳. `_LEDGER`에서 **호출 시점에** 파생한다 — 별도 상수로 두면
+#: `_LEDGER`를 monkeypatch하는 검증 테스트 20개가 전부 `/var/lib` 아래로 쓰려 든다.
+_VERIFY_RECEIPT_DIRNAME = "m05-verify-receipts"
+
+
+def _verify_receipt_root() -> Path:
+    return _LEDGER.parent / _VERIFY_RECEIPT_DIRNAME
+
+
+def _verifier_identity() -> dict[str, object]:
+    """"무엇이 이 판정을 냈나"를 값으로 싣는다.
+
+    `_HARNESS_VERSION`은 **harness 계약** 버전이지 검증기 revision이 아니다. 설치본과
+    브랜치 체크아웃이 갈릴 수 있으므로(4차 리뷰가 정확히 그것을 잡았다) 설치된 Manager
+    revision과 **이 스크립트 자신의 sha256**을 함께 싣는다.
+    """
+
+    try:
+        manager_revision: str | None = trusted_manager_source_revision()
+    except (DeploymentContractError, OSError, ValueError):
+        manager_revision = None
+    try:
+        script_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        script_sha256 = None
+    return {
+        "installed_manager_source_revision": manager_revision,
+        "verifier_script_sha256": script_sha256,
+        "harness_contract_version": _HARNESS_VERSION,
+    }
+
+
+def _write_verify_receipt(
+    checks: list[tuple[str, bool, str]],
+    *,
+    leaf: Path,
+    coverage: str,
+    context: dict[str, object],
+) -> Path | None:
+    """검증 결과를 root-owned 0600 receipt로 남긴다.
+
+    **통과·실패를 모두 남긴다.** 통과만 남기면 "검증한 적 없다"와 "검증했는데
+    떨어졌다"가 같아 보인다 — 승격 근거로 쓰는 기록에서 그 둘이 같아 보이면 안 된다.
+
+    축 목록을 여기서 다시 열거하지 않는다. `checks`를 그대로 직렬화하므로 축이 늘면
+    receipt도 함께 는다(조문 V1의 요구이자, 두 곳에 적으면 한 곳만 갱신되는 것을
+    피하는 규약이다).
+
+    `coverage`가 `complete`가 아니면 **어디서 멈췄는지**를 싣는다. 조기 종료 경로는
+    정의표의 축을 다 재지 못하므로, 그것을 적지 않으면 "축이 몇 개였나"를 나중에 세는
+    사람이 잘못 읽는다.
+
+    실패해도 판정을 뒤집지 않는다(V4) — receipt는 근거의 기록이지 통과 조건이 아니다.
+    다만 조용히 넘어가지도 않는다.
+    """
+
+    payload = {
+        "schema_version": 1,
+        "verified_at": datetime.now(UTC).isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        ),
+        "verifier": _verifier_identity(),
+        "leaf_path": str(leaf),
+        "coverage": coverage,
+        "outcome": "passed" if all(ok for _, ok, _ in checks) else "failed",
+        "axis_count": len(checks),
+        "axes": [
+            {"name": name, "ok": ok, "detail": detail} for name, ok, detail in checks
+        ],
+        "failed_axes": [name for name, ok, _ in checks if not ok],
+        **context,
+    }
+    raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+    stamp = payload["verified_at"].replace(":", "").replace("-", "").replace(".", "")
+    root = _verify_receipt_root()
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = root / f"{leaf.name}-{stamp}.json"
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(fd, raw)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as error:
+        print(f"verify receipt was not written: {type(error).__name__}: {error}", flush=True)
+        return None
+    return path
+
+
+def _report(
+    checks: list[tuple[str, bool, str]],
+    *,
+    leaf: Path | None = None,
+    coverage: str = "complete",
+    context: dict[str, object] | None = None,
+) -> int:
+    """잰 축을 전부 인쇄하고, receipt를 남기고, 종료코드를 낸다.
 
     조기 return 경로에서도 이것을 써야 한다 — 종전에는 m05 attestation이나
     provenance가 거부되면 이미 잰 L0·L1·L2 세 줄이 **한 줄도 인쇄되지 않고**
     한 문장만 남았다. 3차 리뷰가 고친 "이유 없는 exit 1"이 세 파일 중 둘에서
     되살아나 있었다(5차 적대 리뷰 P1).
+
+    출력만으로는 근거가 남지 않는다는 것이 `T-VN-M05-VERIFY-RECEIPT`의 요지다 —
+    pin 회전·history 500칸 링·identity 소각 중 무엇이 먼저 와도 재현이 불가능해진다.
     """
 
     for name, ok, detail in checks:
         print(f"{'PASS' if ok else 'FAIL'} {name} — {detail}", flush=True)
+    if leaf is not None:
+        receipt = _write_verify_receipt(
+            checks, leaf=leaf, coverage=coverage, context=context or {}
+        )
+        if receipt is not None:
+            print(f"verify receipt: {receipt}", flush=True)
     failed = [name for name, ok, _ in checks if not ok]
     if failed:
         print(f"leaf verification FAILED: {', '.join(failed)}", flush=True)
@@ -2428,6 +2657,16 @@ def verify_leaf(leaf: Path) -> int:
     """
 
     checks: list[tuple[str, bool, str]] = []
+    # **조문 V2가 요구하는 대조 입력.** 여기 담기는 값은 전부 아래에서 이미 계산되는
+    # 것들이고, 종전에는 print 문자열에만 들어갔다가 버려졌다. pin이 움직여 재현이
+    # 불가능해져도 "무엇과 대조해 통과했는가"는 남아야 한다.
+    context: dict[str, object] = {
+        "registry_paths": {
+            "execution": str(runtime_execution_registry_path()),
+            "pin": str(runtime_pin_registry_path()),
+            "ledger": str(_LEDGER),
+        }
+    }
 
     def record(name: str, ok: bool, detail: str) -> None:
         checks.append((name, ok, detail))
@@ -2441,11 +2680,23 @@ def verify_leaf(leaf: Path) -> int:
             json.loads(_trusted_leaf_bytes(leaf / "result.json")), name="leaf result"
         )
     except _UntrustedLeaf as error:
-        print(f"leaf is not a trusted root-owned artifact: {error}", flush=True)
-        return 1
-    except (OSError, TypeError, ValueError):
-        print("leaf result.json is unreadable", flush=True)
-        return 1
+        # **거부도 축으로 기록한다.** 종전에는 한 문장만 인쇄하고 `return 1`이라
+        # `checks`가 빈 채로 끝났다 — receipt를 붙여도 "무엇을 봤나"가 비어 있고,
+        # 조문 V1의 "실패도 남긴다"가 가장 필요한 실패 종류가 바로 이것이다
+        # (leaf가 가짜라는 판정).
+        record(
+            "L0 leaf 신뢰 경계",
+            False,
+            f"leaf is not a trusted root-owned artifact: {error}",
+        )
+        return _report(checks, leaf=leaf, coverage="rejected_at_trust_boundary")
+    except (OSError, TypeError, ValueError) as error:
+        record(
+            "L0 leaf 신뢰 경계",
+            False,
+            f"leaf result.json is unreadable: {type(error).__name__}: {error}",
+        )
+        return _report(checks, leaf=leaf, coverage="rejected_at_trust_boundary")
     # 검사 범위를 **정확히** 적는다. 종전 문구는 "증적 하위 디렉터리 포함"이라
     # 적어 leaf 안 전체를 잰 것처럼 읽혔지만, 실제로는 leaf 루트와 증적 파일들의
     # 부모 넷만 본다. 드라이버는 일회용 PinVi 체크아웃 제거 실패를 일부러
@@ -2505,10 +2756,17 @@ def verify_leaf(leaf: Path) -> int:
         provenance_pinvi = _leaf_object(provenance.get("pinvi"), name="provenance pinvi")
     except (KeyError, OSError, TypeError, ValueError) as error:
         record("L2 attestation/provenance 판독", False, f"{type(error).__name__}: {error}")
-        return _report(checks)
+        return _report(
+            checks, leaf=leaf, coverage="rejected_at_attestation_read", context=context
+        )
 
     map_source = PINNED_RUNTIME_RELEASE.source_for("map")
     pinvi_source = PINNED_RUNTIME_RELEASE.source_for("pinvi")
+    context["pinned_pair"] = {
+        "pinset_sha256": PINNED_RUNTIME_RELEASE.pinset_sha256,
+        "map_source_revision": map_source.revision,
+        "pinvi_source_revision": pinvi_source.revision,
+    }
 
     record(
         "L3 pinset",
@@ -2573,6 +2831,12 @@ def verify_leaf(leaf: Path) -> int:
         bound = None
         is_current = False
         execution_blocked = True
+    context["leaf_binding"] = {
+        "execution_identity_sha256": leaf_identity,
+        "binding_manager_source_revision": getattr(bound, "manager_source_revision", None),
+        "binding_found": bound is not None,
+        "is_current_execution": is_current,
+    }
     record(
         "L5 execution identity",
         bound is not None
@@ -2679,6 +2943,7 @@ def verify_leaf(leaf: Path) -> int:
         )
     except (OSError, _UntrustedLeaf):
         claim_present = False
+    context["ledger_claim_name"] = claim
     record(
         "L9 root-only ledger claim",
         claim_present,
@@ -2697,7 +2962,7 @@ def verify_leaf(leaf: Path) -> int:
         f"pinset_blocked={blocked} leaf_execution_blocked={execution_blocked}",
     )
 
-    return _report(checks)
+    return _report(checks, leaf=leaf, coverage="complete", context=context)
 
 def preflight(expected_revision: str) -> int:
     """launcher용 비소비 source-materialization preflight; terminal/ledger를 쓰지 않는다.
@@ -2717,7 +2982,7 @@ def preflight(expected_revision: str) -> int:
         _assert_current_m05_execution_is_runnable(expected_revision)
         _source_pair_preflight()
     except _PhaseError as error:
-        detail = error.diagnostic if error.diagnostic in _PAIR_DIAGNOSTICS else None
+        detail = error.diagnostic if error.diagnostic in _SAFE_DIAGNOSTICS else None
         print(error.phase if detail is None else f"{error.phase}: {detail}", flush=True)
         return 1
     except (OSError, RuntimeError, ValueError) as error:
@@ -4229,6 +4494,31 @@ def main(expected_revision: str, output: Path) -> int:
                 pinset_blocked = False
             if not pinset_blocked:
                 phase = "runtime_execution_block_failed"
+        elif completed and claim_attempted:
+            # **성공도 실행권을 소비한다.** 종전에는 이 분기가 아예 없어서 같은
+            # identity로 acceptance 본문을 두 번 돌 수 있었다(2026-09-07 실측) —
+            # one-shot이 실패에만 걸려 있었다.
+            #
+            # 기록이 실패해도 실행을 실패로 만들지 않는다. 통과한 1~2시간 실행을
+            # 부기 실패로 뒤집는 것이 두 번 돌 수 있는 것보다 나쁘다. 대신 그 사실을
+            # receipt에 싣는다 — 조용히 넘기면 "소비됐다"와 "기록에 실패했다"가
+            # 같아 보인다.
+            try:
+                execution_consumed = consume_current_m05_execution(
+                    expected_manager_revision=expected_revision
+                )
+            except Exception:  # noqa: BLE001 - fixed terminal receipt boundary
+                execution_consumed = False
+            if not execution_consumed:
+                # `result.json`에 키를 더하지 않는다 — 런처가 키 집합을 **정확히**
+                # 강제하므로(`set(value) != expected_keys` → degraded → 무조건 소각)
+                # 그 계약을 건드리면 통과한 실행이 타 버린다.
+                #
+                # print도 안 된다. 운영 경로에서 launcher가 드라이버를
+                # `>/dev/null 2>&1`로 부르므로(run-m05-isolated-e2e-once) 그 문장은
+                # 아무 데도 닿지 않는다 — "조용히 넘기지 않는다"가 거짓이 된다.
+                # 그래서 receipt와 같은 방식으로 **durable marker**를 남긴다.
+                _write_consume_failure_marker(expected_revision, execution_identity)
         for name in _RAW_ENV_NAMES:
             os.environ.pop(name, None)
         result: dict[str, object] = {
