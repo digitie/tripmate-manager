@@ -4612,29 +4612,6 @@ def test_a_consumed_identity_cannot_run_the_body_again(
         driver._assert_current_m05_execution_is_runnable(_CONSUME_MANAGER_REVISION)
 
 
-def test_consumption_is_not_counted_as_a_burn() -> None:
-    """소비는 "승격됐다"이지 "오염됐다"가 아니다.
-
-    소각으로 세면 배포·회전이 막히고, 무엇보다 방금 성공한 leaf가 `--verify-leaf` L8에서
-    실패한다 — 승격 증거가 스스로를 무효화한다. 그래서 scoped phase여야 한다.
-    """
-
-    driver = _driver()
-    _pins, registry = _consumed_registry(driver)
-    consumed = driver.block_current_execution(
-        registry=registry,
-        reason="acceptance consumed",
-        phase=driver._CONSUMED_EXECUTION_PHASE,
-    )
-
-    assert consumed.is_unconditionally_blocked_current() is False
-    assert consumed.has_block_for_current(phase=driver._CONSUMED_EXECUTION_PHASE) is True
-    # L8이 보는 것은 `phase is None`인 기록뿐이다 — 소비 기록은 거기 없어야 한다.
-    assert [entry.phase for entry in consumed.blocked_executions] == [
-        driver._CONSUMED_EXECUTION_PHASE
-    ]
-
-
 def test_a_consumed_leaf_still_verifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4730,3 +4707,110 @@ def test_main_consumes_the_execution_only_on_the_success_branch() -> None:
     assert success_branch < consume_call < end_of_finally
     # 실패 분기에서는 부르지 않는다 — 실패는 소각이지 소비가 아니다.
     assert "consume_current_m05_execution(" not in source[failure_branch:success_branch]
+
+
+def test_a_scoped_infra_block_does_not_look_like_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**소비 검사가 다른 scoped 기록까지 삼키면 안 된다.**
+
+    적대 리뷰가 잡은 구멍이다. `has_block_for_current(phase=...)`에서 `phase=`를 떼면
+    그 술어는 **모든** 차단 기록을 잡는다(registry:254-264) — 인프라 phase로 scoped
+    기록이 남은 identity가 그때부터 영구히 거부되고, 진단은 엉뚱하게
+    `execution_identity_consumed`가 된다. 그것이 #330이 넣고 #331이 되돌린 회귀와
+    같은 부류다.
+
+    앞선 테스트들은 이 축을 **가려 준다** — 깨끗한 registry(기록 0건)와 소비된
+    registry(소비 기록 1건)만 보여 주는데, 둘 다 `phase=` 유무로 답이 갈리지 않는다.
+    갈리는 유일한 상태가 여기 있다: **소비가 아닌 scoped 기록 하나.**
+    """
+
+    driver = _driver()
+    pins, registry = _consumed_registry(driver)
+    infra_blocked = driver.block_current_execution(
+        registry=registry,
+        reason="infra phase failed",
+        phase="runtime_setup_network",
+    )
+    assert infra_blocked.is_unconditionally_blocked_current() is False
+    assert infra_blocked.has_block_for_current(phase="runtime_setup_network") is True
+
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: infra_blocked)
+
+    # 보정 후 재실행이 가능해야 한다 — phase-scoped 설계의 요지다.
+    driver._assert_current_m05_execution_is_runnable(_CONSUME_MANAGER_REVISION)
+
+
+def test_the_consumed_rejection_names_the_recovery_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """조문 2항 — 진단이 무엇을 해야 하는지 말한다.
+
+    phase 이름만 내면 운영자는 "이 실행을 되살릴 수 있나"를 알 수 없다. 되살릴 수 없고
+    새 identity가 필요하다는 것이 답이며, 그것을 말해야 한다.
+    """
+
+    driver = _driver()
+    pins, registry = _consumed_registry(driver)
+    consumed = driver.block_current_execution(
+        registry=registry,
+        reason="acceptance consumed",
+        phase=driver._CONSUMED_EXECUTION_PHASE,
+    )
+    monkeypatch.setattr(driver, "load_runtime_pin_registry", lambda: pins)
+    monkeypatch.setattr(driver, "load_runtime_execution_registry", lambda: consumed)
+
+    with pytest.raises(driver._PhaseError) as refused:
+        driver._assert_current_m05_execution_is_runnable(_CONSUME_MANAGER_REVISION)
+
+    diagnostic = refused.value.diagnostic
+    assert diagnostic == driver._CONSUMED_DIAGNOSTIC
+    assert "rotate or rebind" in diagnostic
+    # 닫힌 어휘에 있어야 preflight가 실제로 내보인다 — 없으면 조용히 삼켜진다.
+    # `_PAIR_DIAGNOSTICS`가 아니라 상위 집합이다: 그쪽은 pair 실패 전용이고,
+    # 그 안의 모든 문자열이 발신된다는 것을 별도 테스트가 양방향으로 결박한다.
+    assert diagnostic in driver._SAFE_DIAGNOSTICS
+    assert diagnostic not in driver._PAIR_DIAGNOSTICS
+
+
+def test_a_failed_consume_record_leaves_a_durable_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """소비 기록 실패를 print로 말하면 운영에서는 **아무 데도 닿지 않는다.**
+
+    launcher가 드라이버를 `>/dev/null 2>&1`로 부른다(run-m05-isolated-e2e-once). 그러면
+    "소비됐다"와 "기록에 실패했다"가 같아 보이고, 그 identity가 실제로는 재실행 가능한
+    채로 남는다. receipt와 같은 방식으로 durable하게 남긴다.
+    """
+
+    driver = _driver()
+    monkeypatch.setattr(driver, "_LEDGER", tmp_path / "ledger")
+
+    driver._write_consume_failure_marker("f" * 40, "a" * 64)
+
+    root = (tmp_path / "ledger").parent / driver._CONSUME_FAILURE_DIRNAME
+    written = sorted(root.glob("*.json"))
+    assert len(written) == 1
+    assert oct(written[0].stat().st_mode & 0o777) == "0o600"
+    assert oct(root.stat().st_mode & 0o777) == "0o700"
+    payload = json.loads(written[0].read_text(encoding="utf-8"))
+    assert payload["execution_identity_sha256"] == "a" * 64
+    assert payload["manager_source_revision"] == "f" * 40
+    assert "still be runnable" in payload["consequence"]
+
+
+def test_the_launcher_discards_driver_stdout_so_prints_are_not_a_channel() -> None:
+    """위 두 테스트의 **전제**를 고정한다.
+
+    launcher가 언젠가 stdout을 보존하게 바뀌면 durable marker가 과잉일 수 있다. 반대로
+    지금 상태에서 print로 되돌리면 보고가 사라진다. 어느 쪽이든 이 전제가 바뀌면
+    알아야 하므로 여기서 잰다.
+    """
+
+    launcher = (
+        Path(__file__).resolve().parents[2] / "scripts/run-m05-isolated-e2e-once"
+    ).read_text(encoding="utf-8")
+    invocation = launcher.index("m05_isolated_e2e.py")
+    tail = launcher[invocation : launcher.index("driver_status=", invocation)]
+    assert ">/dev/null 2>&1" in tail

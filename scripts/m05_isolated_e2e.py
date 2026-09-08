@@ -346,9 +346,12 @@ def _assert_current_m05_execution_is_runnable(
         _fail("terminal_execution_blocked")
     if execution.has_block_for_current(phase=_CONSUMED_EXECUTION_PHASE):
         # 이미 acceptance 본문을 완주한 identity다. 같은 identity로 본문을 두 번 돌면
-        # "실행은 단 한 번"이 깨진다. 고치려면 pair를 회전하거나 rebind해서 **새**
-        # identity를 만들어야 한다 — 이 실행을 되살릴 방법은 없다.
-        _fail(_CONSUMED_EXECUTION_PHASE)
+        # "실행은 단 한 번"이 깨진다.
+        #
+        # **복구 경로를 말한다.** phase 이름만 내면 운영자가 다음 행동을 못 정한다 —
+        # 이 실행은 되살릴 수 없고, 새 execution identity를 만들어야 한다.
+        # `_fail`의 진단은 고정 어휘라 호스트 상태·비밀을 담지 않는다.
+        _fail(_CONSUMED_EXECUTION_PHASE, diagnostic=_CONSUMED_DIAGNOSTIC)
     return execution
 
 
@@ -446,6 +449,52 @@ _PRE_CLAIM_PHASES = frozenset(
 assert _CONSUMED_EXECUTION_PHASE in _PUBLIC_TERMINAL_PHASES
 assert _CONSUMED_EXECUTION_PHASE in _PRE_CLAIM_PHASES
 assert _CONSUMED_EXECUTION_PHASE not in _UNCONDITIONAL_TERMINAL_PHASES
+
+
+#: 소비 기록 실패의 durable marker가 사는 곳. receipt와 같은 뿌리를 쓴다.
+_CONSUME_FAILURE_DIRNAME = "m05-consume-failures"
+
+
+def _write_consume_failure_marker(
+    expected_manager_revision: str, execution_identity: str | None
+) -> None:
+    """소비 기록이 실패했다는 사실을 root-owned 0600 파일로 남긴다.
+
+    운영 경로에서 launcher가 드라이버 stdout을 버리므로 print로는 이 사실이 아무 데도
+    닿지 않는다. 그러면 "소비됐다"와 "기록에 실패했다"가 같아 보이고, 그 identity가
+    실제로는 재실행 가능한 채로 남는다.
+
+    **실패해도 실행을 실패로 만들지 않는다.** 통과한 1~2시간 실행을 부기 실패로 뒤집는
+    것이 두 번 돌 수 있는 것보다 나쁘다.
+    """
+
+    root = _LEDGER.parent / _CONSUME_FAILURE_DIRNAME
+    payload = {
+        "schema_version": 1,
+        "observed_at": datetime.now(UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        "manager_source_revision": expected_manager_revision,
+        "execution_identity_sha256": execution_identity,
+        "consequence": "this execution identity may still be runnable",
+    }
+    raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + chr(10)).encode()
+    stamp = str(payload["observed_at"]).replace(":", "").replace("-", "").replace(".", "")
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(
+            root / f"{stamp}.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(fd, raw)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # 여기까지 실패하면 남길 채널이 없다. 실행 판정을 뒤집지는 않는다.
+        pass
 
 
 def consume_current_m05_execution(*, expected_manager_revision: str) -> bool:
@@ -1817,6 +1866,13 @@ def _canonical_json(value: object) -> bytes:
 #: 않고 접두로 거르므로, 새 문구가 생겨도 이 상수가 뒤처지지 않는다.
 _SOURCE_DIAGNOSTIC_PREFIX = "pinned runtime source "
 
+#: 소비된 identity로 다시 부를 때 내는 고정 진단. 값이 이 파일의 상수라 호스트 상태나
+#: 비밀이 섞일 수 없다 — 어휘 규약(위 주석) 그대로다.
+_CONSUMED_DIAGNOSTIC = (
+    "execution identity already consumed by a completed acceptance run;"
+    " rotate or rebind the runtime pair to obtain a new identity"
+)
+
 _PAIR_DIAGNOSTICS: frozenset[str] = frozenset(
     {
         "pair contract is unreadable",
@@ -1838,6 +1894,13 @@ _PAIR_DIAGNOSTICS: frozenset[str] = frozenset(
         "derived application head differs from the committed generation",
     }
 )
+
+#: preflight가 stdout으로 **내보내도 되는** 진단 전체.
+#:
+#: `_PAIR_DIAGNOSTICS`에 소비 진단을 섞지 않는다 — 그 집합은 이름 그대로 pair 실패
+#: 어휘이고, "그 안의 모든 문자열이 실제로 발신된다"를 기존 테스트가 양방향으로
+#: 결박한다. 다른 phase의 진단을 넣으면 그 결박이 거짓이 된다.
+_SAFE_DIAGNOSTICS: frozenset[str] = _PAIR_DIAGNOSTICS | frozenset({_CONSUMED_DIAGNOSTIC})
 
 
 def _sha256_text(value: object) -> str:
@@ -2919,7 +2982,7 @@ def preflight(expected_revision: str) -> int:
         _assert_current_m05_execution_is_runnable(expected_revision)
         _source_pair_preflight()
     except _PhaseError as error:
-        detail = error.diagnostic if error.diagnostic in _PAIR_DIAGNOSTICS else None
+        detail = error.diagnostic if error.diagnostic in _SAFE_DIAGNOSTICS else None
         print(error.phase if detail is None else f"{error.phase}: {detail}", flush=True)
         return 1
     except (OSError, RuntimeError, ValueError) as error:
@@ -4449,12 +4512,13 @@ def main(expected_revision: str, output: Path) -> int:
             if not execution_consumed:
                 # `result.json`에 키를 더하지 않는다 — 런처가 키 집합을 **정확히**
                 # 강제하므로(`set(value) != expected_keys` → degraded → 무조건 소각)
-                # 그 계약을 건드리면 통과한 실행이 타 버린다. 대신 로그로 말한다.
-                print(
-                    "execution identity consume record failed —"
-                    " this identity may still be runnable",
-                    flush=True,
-                )
+                # 그 계약을 건드리면 통과한 실행이 타 버린다.
+                #
+                # print도 안 된다. 운영 경로에서 launcher가 드라이버를
+                # `>/dev/null 2>&1`로 부르므로(run-m05-isolated-e2e-once) 그 문장은
+                # 아무 데도 닿지 않는다 — "조용히 넘기지 않는다"가 거짓이 된다.
+                # 그래서 receipt와 같은 방식으로 **durable marker**를 남긴다.
+                _write_consume_failure_marker(expected_revision, execution_identity)
         for name in _RAW_ENV_NAMES:
             os.environ.pop(name, None)
         result: dict[str, object] = {
